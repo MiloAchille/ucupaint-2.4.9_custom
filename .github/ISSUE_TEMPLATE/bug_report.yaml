@@ -1,0 +1,57 @@
+name: 🐞 Bug report
+description: Create a report to help us improve.
+labels: ["bug"]
+body:
+  - type: input
+    id: ucupaintversion
+    attributes:
+      label: Ucupaint Version
+      description: Type Ucupaint version here.
+      placeholder: ex. 2.2.0
+    validations:
+      required: true
+  - type: input
+    id: blenderversion
+    attributes:
+      label: Blender Version
+      description: Type Blender version here.
+      placeholder: ex. 3.6.0
+    validations:
+      required: true
+  - type: input
+    id: operatingsystem
+    attributes:
+      label: Operating System
+      description: Type the operating system you used here.
+      placeholder: ex. Windows 11
+    validations:
+      required: true
+  - type: textarea
+    id: describebug
+    attributes:
+      label: Describe The Bug
+      description: A clear and concise description of what the bug is.
+      placeholder: ex. This should happen, but that happens instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproducebug
+    attributes:
+      label: To Reproduce
+      description: Steps to reproduce the bug, plus a sample file. The file is optional, but please include it whenever possible, it greatly helps with debugging.
+      placeholder: |
+        1. Go to '...'
+        2. Click on '....'
+        3. Scroll down to '....'
+        4. See error
+
+        Sample file : (Link to sample file)
+    validations:
+      required: true
+  - type: textarea
+    id: incaseofcrash
+    attributes:
+      label: In the case of a crash or when relevant include the logs
+      description: Please include the logs (https://docs.blender.org/manual/en/latest/troubleshooting/crash.html#crash-log)
+    validations:
+      required: false
