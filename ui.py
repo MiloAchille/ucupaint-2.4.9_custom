@@ -5930,7 +5930,8 @@ class YNewLayerMenu(bpy.types.Menu):
         #col.context_pointer_set('group_node', context.group_node)
         #col.label(text='Image:')
         col.operator("wm.y_new_layer", text='New Image', icon_value=lib.get_icon('image')).type = 'IMAGE'
-        col.operator("wm.y_new_path_layer", text='New Path Layer', icon='CURVE_DATA' if is_bl_newer_than(2, 80) else 'CURVE_BEZCURVE')
+        col.operator("wm.y_new_path_layer", text='New Path Layer', icon='CURVE_DATA' if is_bl_newer_than(2, 80) else 'CURVE_BEZCURVE').path_mode = 'RIBBON'
+        col.operator("wm.y_new_path_layer", text='New Shape Layer', icon='MESH_CIRCLE' if is_bl_newer_than(2, 80) else 'CURVE_BEZCIRCLE').path_mode = 'SHAPE'
 
         #col.separator()
 
