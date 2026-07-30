@@ -5201,6 +5201,7 @@ def duplicate_layer_nodes_and_images(tree, specific_layers=[], packed_duplicate=
     vcol_nodes = []
     vcol_names = []
     duplicated_empties = {}
+    duplicated_path_curves = {}
     for layer in yp.layers:
         if specific_layers and layer not in specific_layers: continue
 
@@ -5231,6 +5232,10 @@ def duplicate_layer_nodes_and_images(tree, specific_layers=[], packed_duplicate=
         # Decal object duplicate
         if layer.texcoord_type == 'Decal':
             duplicate_decal_empty_reference(layer.texcoord, ttree, set_new_decal_position, duplicated_empties)
+
+        # Path / shape curve duplicate
+        if getattr(layer, 'enable_path_bake', False):
+            BakePath.duplicate_path_curve_for_layer(layer, duplicated_path_curves)
 
         # Duplicate baked layer image
         baked_layer_source = get_layer_source(layer, get_baked=True)
