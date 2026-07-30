@@ -90,8 +90,10 @@ def add_new_layer(
 
     yp = group_tree.yp
     ypup = get_user_preferences()
-    obj = bpy.context.object
-    mat = obj.active_material
+    # Path/shape curves are selectable for editing; resolve to the painted mesh
+    # so material/UV helpers still see a MESH with an active material.
+    obj = get_ypaint_ui_object(bpy.context.object) or bpy.context.object
+    mat = get_active_material(obj) if obj else None
 
     # Halt rearrangements and reconnections until all nodes already created
     yp.halt_reconnect = True
@@ -140,7 +142,8 @@ def add_new_layer(
         uv_name = get_default_uv_name()
 
     layer.uv_name = uv_name
-    check_uvmap_on_other_objects_with_same_mat(mat, uv_name)
+    if mat:
+        check_uvmap_on_other_objects_with_same_mat(mat, uv_name)
 
     if segment:
         layer.segment_name = segment.name
