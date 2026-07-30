@@ -664,6 +664,9 @@ def _barycentric_uv(p, a, b, c, uva, uvb, uvc):
 def _soft_falloff(t, power=1.0):
     '''t in 0..1 (0=center, 1=edge). Returns opacity.'''
     t = max(0.0, min(1.0, t))
+    # Hard edge when falloff is 0
+    if power <= 0.0:
+        return 1.0 if t < 1.0 - 1e-6 else 0.0
     # Smoothstep-like edge
     a = 1.0 - t * t * (3.0 - 2.0 * t)
     if power != 1.0:
@@ -779,6 +782,166 @@ def _project_polyline_to_uv(polyline, bvh, tris, project_distance):
         prev = uv
     return uvs, seam_jumps
 
+def _fit_polyline_plane(polyline):
+    '''Return (center, axis_u, axis_v, normal) for the best-fit plane of the polyline.'''
+    n = len(polyline)
+    center = Vector((0.0, 0.0, 0.0))
+    for p in polyline:
+        center += p
+    center /= float(max(n, 1))
+
+    coords = numpy.array([[p.x, p.y, p.z] for p in polyline], dtype=numpy.float64)
+    centered = coords - numpy.array((center.x, center.y, center.z), dtype=numpy.float64)
+    cov = centered.T @ centered / float(max(n, 1))
+    try:
+        _eigvals, eigvecs = numpy.linalg.eigh(cov)
+        normal = Vector(eigvecs[:, 0].tolist())
+    except Exception:
+        normal = Vector((0.0, 0.0, 1.0))
+    if normal.length < 1e-8:
+        normal = Vector((0.0, 0.0, 1.0))
+    else:
+        normal.normalize()
+
+    axis_u = normal.cross(Vector((0.0, 0.0, 1.0)))
+    if axis_u.length < 1e-6:
+        axis_u = normal.cross(Vector((0.0, 1.0, 0.0)))
+    if axis_u.length < 1e-8:
+        axis_u = Vector((1.0, 0.0, 0.0))
+    else:
+        axis_u.normalize()
+    axis_v = normal.cross(axis_u)
+    if axis_v.length < 1e-8:
+        axis_v = Vector((0.0, 1.0, 0.0))
+    else:
+        axis_v.normalize()
+    return center, axis_u, axis_v, normal
+
+def _project_shape_polyline_to_uv(polyline, bvh, tris, project_distance):
+    '''
+    Map a closed world-space shape into UV continuously.
+
+    Default: nearest-surface UVs (accurate placement under the curve).
+    Only when a clear overhang is present: keep nearest UVs on-mesh and
+    extrapolate off-mesh points with a plane->UV affine fit so the fill can
+    extend into empty texture padding past island edges.
+    '''
+    if len(polyline) < 3:
+        return [], 0
+
+    # Per-point hits (None if no hit within project_distance)
+    point_hits = []  # list of (uv, dist) or None
+    hit_dists = []
+    hits = []  # (index, p, uv, dist)
+    prev_uv = None
+    seam_jumps = 0
+    for i, p in enumerate(polyline):
+        hit = _nearest_uv(bvh, tris, p, max_dist=project_distance)
+        if not hit:
+            point_hits.append(None)
+            continue
+        _loc, _n, uv, dist = hit
+        point_hits.append((uv.copy(), dist))
+        hit_dists.append(dist)
+        hits.append((i, p, uv, dist))
+        if prev_uv is not None and (uv - prev_uv).length > 0.25:
+            seam_jumps += 1
+        prev_uv = uv
+
+    if len(hits) < 3:
+        return _project_polyline_to_uv(polyline, bvh, tris, project_distance)
+
+    sorted_d = sorted(hit_dists)
+    median = sorted_d[len(sorted_d) // 2]
+    # Strict: only points much farther than the typical on-surface distance
+    # count as overhang. Loose thresholds previously mis-tagged curved on-mesh
+    # points and mixed affine UVs into an otherwise good outline.
+    on_thresh = max(median * 6.0, sorted_d[0] * 12.0, 1e-5)
+    if project_distance is not None:
+        on_thresh = min(on_thresh, max(project_distance * 0.35, median * 3.0 + 1e-6))
+
+    overhang_indices = set()
+    for i, ph in enumerate(point_hits):
+        if ph is None or ph[1] > on_thresh:
+            overhang_indices.add(i)
+
+    # No clear overhang → pure nearest (stable placement; identical to old path)
+    if len(overhang_indices) < 3:
+        uvs = []
+        for ph in point_hits:
+            if ph is not None:
+                uvs.append(ph[0].copy())
+        if len(uvs) < 3:
+            return _project_polyline_to_uv(polyline, bvh, tris, project_distance)
+        return uvs, seam_jumps
+
+    center, axis_u, axis_v, _normal = _fit_polyline_plane(polyline)
+
+    def to_plane(p):
+        d = p - center
+        return (d.dot(axis_u), d.dot(axis_v))
+
+    samples_st = []
+    samples_uv = []
+    for _i, p, uv, dist in hits:
+        if dist > on_thresh:
+            continue
+        s, t = to_plane(p)
+        samples_st.append((s, t))
+        samples_uv.append((uv.x, uv.y))
+
+    if len(samples_st) < 3:
+        closest = sorted(hits, key=lambda h: h[3])[:max(3, len(hits) // 3)]
+        samples_st = []
+        samples_uv = []
+        for _i, p, uv, _dist in closest:
+            s, t = to_plane(p)
+            samples_st.append((s, t))
+            samples_uv.append((uv.x, uv.y))
+
+    xu = xv = None
+    affine_ok = False
+    if len(samples_st) >= 3:
+        A = numpy.array([[s, t, 1.0] for s, t in samples_st], dtype=numpy.float64)
+        bu = numpy.array([uv[0] for uv in samples_uv], dtype=numpy.float64)
+        bv = numpy.array([uv[1] for uv in samples_uv], dtype=numpy.float64)
+        try:
+            xu, _, _, _ = numpy.linalg.lstsq(A, bu, rcond=None)
+            xv, _, _, _ = numpy.linalg.lstsq(A, bv, rcond=None)
+            pred_u = A @ xu
+            pred_v = A @ xv
+            err = float(numpy.sqrt(numpy.mean((pred_u - bu) ** 2 + (pred_v - bv) ** 2)))
+            # High residual / seam jumps → skip affine (avoid smear across islands)
+            affine_ok = err <= 0.08 and seam_jumps < 3
+        except Exception:
+            affine_ok = False
+
+    if not affine_ok:
+        uvs = []
+        for ph in point_hits:
+            if ph is not None:
+                uvs.append(ph[0].copy())
+        if len(uvs) < 3:
+            return _project_polyline_to_uv(polyline, bvh, tris, project_distance)
+        return uvs, seam_jumps
+
+    def affine_uv(p):
+        s, t = to_plane(p)
+        return Vector((
+            float(xu[0] * s + xu[1] * t + xu[2]),
+            float(xv[0] * s + xv[1] * t + xv[2]),
+        ))
+
+    # Hybrid: nearest on-mesh, affine only for clear overhang / missed points
+    uvs = []
+    for i, p in enumerate(polyline):
+        if i in overhang_indices:
+            uvs.append(affine_uv(p))
+        else:
+            ph = point_hits[i]
+            uvs.append(ph[0].copy() if ph is not None else affine_uv(p))
+    return uvs, seam_jumps
+
 def _decimate_poly(poly, max_points=96):
     '''Keep polygon under max_points by uniform stride (closed loop).'''
     n = len(poly)
@@ -871,19 +1034,58 @@ def bake_shape_to_image(obj, image, curve_obj, uv_name, resolution,
 
     # Shapes don't need hundreds of outline samples — cap for speed/quality balance
     shape_res = min(max(int(resolution), 16), 96)
-    polyline = _curve_to_polyline(curve_obj, resolution=shape_res)
-    if len(polyline) < 3:
-        return False, 'Closed shape needs at least 3 projected points'
 
-    # Close the world-space loop if needed
-    if (polyline[0] - polyline[-1]).length > 1e-6:
-        polyline = list(polyline) + [polyline[0].copy()]
+    # Authored silhouette preserves overhang past the mesh. Evaluated / shrinkwrap
+    # silhouette matches the viewport for shapes that sit fully on the surface.
+    authored = _sample_bezier_math(curve_obj, shape_res)
+    evaluated = _curve_to_polyline(curve_obj, resolution=shape_res)
 
     if project_distance is None:
         dim = max(obj.dimensions) if obj.dimensions.length > 0 else 1.0
         project_distance = max(dim * 0.5, 0.1)
 
-    uvs, seam_jumps = _project_polyline_to_uv(polyline, bvh, tris, project_distance)
+    def _close_loop(pts):
+        if len(pts) < 3:
+            return pts
+        if (pts[0] - pts[-1]).length > 1e-6:
+            return list(pts) + [pts[0].copy()]
+        return pts
+
+    def _count_overhang(pts):
+        if len(pts) < 3:
+            return 0
+        dists = []
+        misses = 0
+        for p in pts:
+            hit = _nearest_uv(bvh, tris, p, max_dist=project_distance)
+            if not hit:
+                misses += 1
+                continue
+            dists.append(hit[3])
+        if len(dists) < 3:
+            return misses
+        sd = sorted(dists)
+        median = sd[len(sd) // 2]
+        thresh = max(median * 6.0, sd[0] * 12.0, 1e-5)
+        if project_distance is not None:
+            thresh = min(thresh, max(project_distance * 0.35, median * 3.0 + 1e-6))
+        n_far = sum(1 for d in dists if d > thresh)
+        return n_far + misses
+
+    authored = _close_loop(authored) if len(authored) >= 3 else []
+    evaluated = _close_loop(evaluated) if len(evaluated) >= 3 else []
+
+    use_overhang = len(authored) >= 3 and _count_overhang(authored) >= 3
+    if use_overhang:
+        polyline = authored
+        uvs, seam_jumps = _project_shape_polyline_to_uv(polyline, bvh, tris, project_distance)
+    else:
+        # Stable path: bake the shrinkwrapped / evaluated shape with nearest UVs only
+        polyline = evaluated if len(evaluated) >= 3 else authored
+        if len(polyline) < 3:
+            return False, 'Closed shape needs at least 3 projected points'
+        uvs, seam_jumps = _project_polyline_to_uv(polyline, bvh, tris, project_distance)
+
     if len(uvs) < 3:
         return False, 'Could not project the shape onto the mesh UVs'
 
@@ -912,8 +1114,10 @@ def bake_shape_to_image(obj, image, curve_obj, uv_name, resolution,
         # Blur a cropped region for speed, then write back
         crop = mask[min_y:max_y + 1, min_x:max_x + 1]
         crop = _box_blur_mask(crop, feather)
-        # Falloff curve on alpha
-        if falloff != 1.0:
+        # Falloff curve on alpha (0 = hard threshold after blur)
+        if falloff <= 0.0:
+            crop = (crop >= 0.5).astype(numpy.float32)
+        elif falloff != 1.0:
             crop = numpy.power(numpy.clip(crop, 0.0, 1.0), float(falloff)).astype(numpy.float32)
         mask[min_y:max_y + 1, min_x:max_x + 1] = crop
 
@@ -987,6 +1191,10 @@ def bake_shape_to_image(obj, image, curve_obj, uv_name, resolution,
 
     total = img_w * img_h
     msg = 'Filled shape (%d / %d pixels)' % (filled, total)
+    uv_xs = [uv.x for uv in uvs]
+    uv_ys = [uv.y for uv in uvs]
+    if min(uv_xs) < -0.01 or max(uv_xs) > 1.01 or min(uv_ys) < -0.01 or max(uv_ys) > 1.01:
+        msg += ' — overhangs UV sheet'
     if seam_jumps > 0:
         msg += ' — warning: %d UV seam jumps (shape may look wrong across islands)' % seam_jumps
     return True, msg
@@ -1264,8 +1472,8 @@ class BaseBakePath():
 
     path_falloff : FloatProperty(
         name = 'Edge Falloff',
-        description = 'Softness of the ribbon edge or shape fringe (higher = softer)',
-        default = 1.0, min = 0.1, max = 8.0
+        description = 'Softness of the ribbon edge or shape fringe (0 = hard, higher = softer)',
+        default = 1.0, min = 0.0, max = 8.0
     )
 
     path_shape_feather : FloatProperty(
