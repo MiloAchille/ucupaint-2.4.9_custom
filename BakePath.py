@@ -168,7 +168,7 @@ def create_path_curve(target_obj, name='Path', use_shrinkwrap=True, cyclic=False
     curve_name = get_unique_name(name, bpy.data.objects)
     curve_data = bpy.data.curves.new(curve_name, type='CURVE')
     curve_data.dimensions = '3D'
-    curve_data.resolution_u = 128
+    curve_data.resolution_u = 12
 
     spline = curve_data.splines.new('BEZIER')
 
@@ -627,155 +627,24 @@ def _blend_pixel(pxs, px, py, rgba, strength):
     else:
         pxs[py, px, 3] = 0.0
 
-def _ribbon_body_strength(v_across, falloff):
-    '''
-    Full opacity across most of the ribbon; soft falloff only near the edges.
-    Fixes washed-out / striped wide sections from soft stamps everywhere.
-    '''
-    a = abs(float(v_across))
-    if a >= 1.0:
-        return 0.0 if falloff > 0.0 else (1.0 if a <= 1.0 else 0.0)
-    if falloff <= 0.0:
-        return 1.0
-    # Soften only the outer ~35% of the half-width
-    edge_start = 0.65
-    if a <= edge_start:
-        return 1.0
-    t = (a - edge_start) / max(1.0 - edge_start, 1e-6)
-    return _soft_falloff(t, power=falloff)
-
-def _fill_ribbon_tri(pxs, img_w, img_h, uv0, uv1, uv2, attr0, attr1, attr2,
-                     rgba_at, falloff, max_edge_px, solid_rgba=None):
-    '''
-    Solid-fill a UV triangle. attrs are (u_len, v_across) at each corner.
-    Returns number of pixels touched.
-    '''
-    d01 = _uv_pixel_dist(uv0, uv1, img_w, img_h)
-    d12 = _uv_pixel_dist(uv1, uv2, img_w, img_h)
-    d20 = _uv_pixel_dist(uv2, uv0, img_w, img_h)
-    if max(d01, d12, d20) > max_edge_px:
-        return 0
-
-    x0 = uv0.x * (img_w - 1)
-    y0 = uv0.y * (img_h - 1)
-    x1 = uv1.x * (img_w - 1)
-    y1 = uv1.y * (img_h - 1)
-    x2 = uv2.x * (img_w - 1)
-    y2 = uv2.y * (img_h - 1)
-
-    min_x = max(0, int(math.floor(min(x0, x1, x2))))
-    max_x = min(img_w - 1, int(math.ceil(max(x0, x1, x2))))
-    min_y = max(0, int(math.floor(min(y0, y1, y2))))
-    max_y = min(img_h - 1, int(math.ceil(max(y0, y1, y2))))
-    if min_x > max_x or min_y > max_y:
-        return 0
-
-    area2 = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0)
-    if abs(area2) < 1e-8:
-        return 0
-
-    xs = numpy.arange(min_x, max_x + 1, dtype=numpy.float64) + 0.5
-    ys = numpy.arange(min_y, max_y + 1, dtype=numpy.float64) + 0.5
-    grid_x, grid_y = numpy.meshgrid(xs, ys)
-
-    v0x = x1 - x0
-    v0y = y1 - y0
-    v1x = x2 - x0
-    v1y = y2 - y0
-    v2x = grid_x - x0
-    v2y = grid_y - y0
-    den = v0x * v1y - v1x * v0y
-    if abs(den) < 1e-20:
-        return 0
-    w1 = (v2x * v1y - v1x * v2y) / den
-    w2 = (v0x * v2y - v2x * v0y) / den
-    w0 = 1.0 - w1 - w2
-    eps = -1e-4
-    mask = (w0 >= eps) & (w1 >= eps) & (w2 >= eps)
-    if not numpy.any(mask):
-        return 0
-
-    w0m = w0[mask].astype(numpy.float32)
-    w1m = w1[mask].astype(numpy.float32)
-    w2m = w2[mask].astype(numpy.float32)
-    u_len = attr0[0] * w0m + attr1[0] * w1m + attr2[0] * w2m
-    v_ac = attr0[1] * w0m + attr1[1] * w1m + attr2[1] * w2m
-
-    # Vectorized body/edge strength
-    aa = numpy.abs(v_ac)
-    if falloff <= 0.0:
-        strengths = (aa <= 1.0).astype(numpy.float32)
-    else:
-        edge_start = 0.65
-        strengths = numpy.ones(aa.shape, dtype=numpy.float32)
-        soft = aa > edge_start
-        if numpy.any(soft):
-            t = (aa[soft] - edge_start) / max(1.0 - edge_start, 1e-6)
-            t = numpy.clip(t, 0.0, 1.0)
-            # Match _soft_falloff softstep
-            s = 1.0 - t * t * (3.0 - 2.0 * t)
-            if falloff != 1.0:
-                s = numpy.power(numpy.clip(s, 0.0, 1.0), float(falloff))
-            strengths[soft] = s.astype(numpy.float32)
-        strengths[aa >= 1.0] = 0.0
-
-    ys_i, xs_i = numpy.nonzero(mask)
-    ys_i = ys_i + min_y
-    xs_i = xs_i + min_x
-    live = strengths > 1e-4
-    if not numpy.any(live):
-        return 0
-    xs_i = xs_i[live]
-    ys_i = ys_i[live]
-    strengths = strengths[live]
-    u_len = u_len[live]
-    v_ac = v_ac[live]
-
-    # Fast path: solid color, nearly opaque body — vectorized over-write
-    if solid_rgba is not None:
-        cr, cg, cb, ca = [float(c) for c in solid_rgba]
-        opaque = strengths >= 0.995
-        if numpy.any(opaque):
-            xo = xs_i[opaque]
-            yo = ys_i[opaque]
-            # Max-alpha style: write solid where we cover
-            pxs[yo, xo, 0] = cr
-            pxs[yo, xo, 1] = cg
-            pxs[yo, xo, 2] = cb
-            pxs[yo, xo, 3] = numpy.maximum(pxs[yo, xo, 3], ca)
-        soft_idx = numpy.nonzero(~opaque)[0]
-        for k in soft_idx:
-            _blend_pixel(
-                pxs, int(xs_i[k]), int(ys_i[k]), solid_rgba, float(strengths[k])
-            )
-        return int(xs_i.shape[0])
-
-    for k in range(len(xs_i)):
-        rgba = rgba_at(float(u_len[k]), float(v_ac[k]))
-        _blend_pixel(pxs, int(xs_i[k]), int(ys_i[k]), rgba, float(strengths[k]))
-    return int(xs_i.shape[0])
-
 def _splat_rgba(pxs, width, height, u, v, rgba, strength, radius_px=1.0):
     '''Stamp into float32 array shaped (height, width, 4), with optional brush radius in pixels.'''
     if strength <= 1e-6:
         return
+    # Clamp to image bounds so brushes near UV island / sheet edges still write bleed pixels
     u = max(0.0, min(1.0, u))
     v = max(0.0, min(1.0, v))
+
     x = u * (width - 1)
     y = v * (height - 1)
-    radius = max(0.6, min(2.5, float(radius_px)))
-    if radius <= 0.85:
-        px = int(round(x))
-        py = int(round(y))
-        if 0 <= px < width and 0 <= py < height:
-            _blend_pixel(pxs, px, py, rgba, strength)
-        return
-    r_ceil = int(math.ceil(radius))
+    radius = max(0.75, float(radius_px))
+    r_ceil = int(math.ceil(radius)) + 1
     x0 = max(0, int(math.floor(x)) - r_ceil)
     x1 = min(width - 1, int(math.ceil(x)) + r_ceil)
     y0 = max(0, int(math.floor(y)) - r_ceil)
     y1 = min(height - 1, int(math.ceil(y)) + r_ceil)
     r2 = radius * radius
+
     for py in range(y0, y1 + 1):
         for px in range(x0, x1 + 1):
             dx = px - x
@@ -783,8 +652,10 @@ def _splat_rgba(pxs, width, height, u, v, rgba, strength, radius_px=1.0):
             d2 = dx * dx + dy * dy
             if d2 > r2:
                 continue
+            # Soft disk falloff inside brush
             w = 1.0 - math.sqrt(d2) / radius
-            _blend_pixel(pxs, px, py, rgba, strength * (w * w))
+            w = w * w
+            _blend_pixel(pxs, px, py, rgba, strength * w)
 
 def _sample_path_texture(tex_pxs, tw, th, u_len, v_across, tile_u=1.0, rotation_deg=0.0):
     '''Sample path stamp texture. u_len 0..1 along path, v_across -1..1 across width.'''
@@ -1210,42 +1081,37 @@ def bake_shape_to_image(obj, image, curve_obj, uv_name, resolution,
 
 def _bake_quality_settings(quality):
     '''
-    Bake quality → cost/quality knobs.
-
-    Cost should increase Low → Ultra:
-      - res_scale: fewer/more samples along the path
-      - px_step: spacing between width lanes and bridge stamps (larger = faster)
-      - splat_px: small fixed brush radius (never inflate with stride — that made Low slower)
-      - max_width_lanes: hard cap on across-path samples
+    Map bake quality to sampling / stamp density.
+    Width only affects ribbon thickness; quality controls cost.
     '''
     table = {
         'LOW': {
             'res_scale': 0.35,
-            'px_step': 2.5,
-            'splat_px': 1.35,
-            'max_width_lanes': 48,
-            'shape_res_cap': 40,
+            'stride': 3,
+            'bridge_step': 3.0,
+            'shape_res_cap': 48,
+            'width_samples': 8,
         },
         'MEDIUM': {
             'res_scale': 0.6,
-            'px_step': 1.5,
-            'splat_px': 1.2,
-            'max_width_lanes': 80,
-            'shape_res_cap': 64,
+            'stride': 2,
+            'bridge_step': 2.0,
+            'shape_res_cap': 72,
+            'width_samples': 16,
         },
         'HIGH': {
             'res_scale': 1.0,
-            'px_step': 1.0,
-            'splat_px': 1.1,
-            'max_width_lanes': 128,
+            'stride': 1,
+            'bridge_step': 1.0,
             'shape_res_cap': 96,
+            'width_samples': 32,
         },
         'ULTRA': {
-            'res_scale': 1.35,
-            'px_step': 0.75,
-            'splat_px': 1.0,
-            'max_width_lanes': 160,
+            'res_scale': 1.5,
+            'stride': 1,
+            'bridge_step': 0.75,
             'shape_res_cap': 128,
+            'width_samples': 48,
         },
     }
     return table.get(quality, table['MEDIUM'])
@@ -1286,8 +1152,8 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
 
     q = _bake_quality_settings(quality)
     eff_res = max(8, int(round(resolution * q['res_scale'])))
-    px_step = max(0.5, float(q['px_step']))
-    max_width_lanes = max(8, int(q['max_width_lanes']))
+    stamp_stride = max(1, int(q['stride']))
+    bridge_step = max(0.5, float(q['bridge_step']))
 
     polyline, radii, cyclic = _prepare_bake_polyline(curve_obj, eff_res)
     if len(polyline) < 2:
@@ -1327,9 +1193,11 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
 
     width_mult = float(width)
     n_len = len(polyline)
+    n_width = max(3, int(q.get('width_samples', 16)))
     stamps = 0
 
     # Project ribbon in 3D across the surface so width can land on neighboring UV islands.
+    # UV-only disks stay on one chart and cannot follow the mesh across seams.
     def _rgba_at(u_len, v_across):
         if tex_pxs is not None:
             rgba = _sample_path_texture(
@@ -1344,10 +1212,9 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
             )
         return color
 
-    # --- Pass 1: centerline hits + local UV scale (px per world unit) ---
-    centers = [None] * n_len  # (c_loc, c_normal, uv, side, half_w, u_len)
+    # lanes[j][i] = (uv, u_len, v_across, strength) or None
+    lanes = [[None for _ in range(n_len)] for _ in range(n_width)]
     prev_side = None
-    scales = []
 
     for i in range(n_len):
         p = polyline[i]
@@ -1366,7 +1233,7 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
         center = _nearest_uv(bvh, tris, p, max_dist=project_distance)
         if not center:
             continue
-        c_loc, c_normal, c_uv, _ = center
+        c_loc, c_normal, _, _ = center
 
         side = c_normal.cross(tangent)
         if side.length < 1e-8:
@@ -1376,6 +1243,7 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
         if side.length < 1e-8:
             continue
         side.normalize()
+        # Keep ribbon side from flipping along the stroke
         if prev_side is not None and side.dot(prev_side) < 0.0:
             side = -side
         prev_side = side.copy()
@@ -1385,33 +1253,8 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
         else:
             u_len = i / float(max(n_len - 1, 1))
 
+        # Ribbon half-width = control-point Radius * Width Multiplier
         half_w = max(float(radii[i]) * width_mult * 0.5, 1e-8)
-        centers[i] = (c_loc, c_normal, c_uv.copy(), side.copy(), half_w, u_len)
-
-        probe_d = min(half_w * 0.25, max(half_w, 1e-4))
-        probe_d = max(min(probe_d, half_w), 1e-4)
-        probe = _nearest_uv(bvh, tris, c_loc + side * probe_d, max_dist=project_distance)
-        if probe:
-            _pl, _pn, p_uv, _ = probe
-            uv_d = _uv_pixel_dist(c_uv, p_uv, img_w, img_h)
-            if probe_d > 1e-8 and uv_d > 0.1:
-                scales.append(uv_d / probe_d)
-
-    uv_scale = (sum(scales) / len(scales)) if scales else float(max(img_w, img_h)) * 0.05
-    max_half_w = max((c[4] for c in centers if c is not None), default=eff_width * 0.5)
-    width_px = max(max_half_w * 2.0 * uv_scale, 1.0)
-    # Lane count from ribbon width ÷ quality spacing (Low = fewer lanes)
-    n_width = int(math.ceil(width_px / px_step)) + 1
-    n_width = max(3, min(n_width, max_width_lanes))
-
-    # lanes[j][i] = (uv, u_len, v_across, strength) or None
-    lanes = [[None for _ in range(n_len)] for _ in range(n_width)]
-
-    for i in range(n_len):
-        c = centers[i]
-        if c is None:
-            continue
-        c_loc, c_normal, _c_uv, side, half_w, u_len = c
         lift = max(half_w * 0.25, project_distance * 0.005)
 
         for j in range(n_width):
@@ -1428,12 +1271,11 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
             if not hit:
                 continue
             _, _, uv, _ = hit
-            # Store UV + path params; opacity comes from edge falloff during solid fill
-            lanes[j][i] = (uv.copy(), u_len, v_across)
+            strength = _soft_falloff(abs(v_across), power=falloff)
+            lanes[j][i] = (uv.copy(), u_len, v_across, strength)
 
-    # Seam limit: along-path edges stay tight; across-width may span the full ribbon
+    # Local splat radius from typical along-path UV spacing (not full ribbon width in UV)
     step_dists = []
-    across_dists = []
     for j in range(n_width):
         for i in range(n_len):
             a = lanes[j][i]
@@ -1444,55 +1286,59 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
             if a is None or b is None:
                 continue
             d = _uv_pixel_dist(a[0], b[0], img_w, img_h)
-            if 0.25 < d < max(img_w, img_h) * 0.25:
+            if 0.25 < d < max(img_w, img_h) * 0.2:
                 step_dists.append(d)
-    for i in range(n_len):
-        for j in range(n_width - 1):
-            a = lanes[j][i]
-            b = lanes[j + 1][i]
-            if a is None or b is None:
-                continue
-            d = _uv_pixel_dist(a[0], b[0], img_w, img_h)
-            if 0.1 < d < max(img_w, img_h) * 0.5:
-                across_dists.append(d)
+    median_step = sorted(step_dists)[len(step_dists) // 2] if step_dists else 2.0
+    # Stay on the same island when bridging; also used as splat size
+    max_bridge_px = max(median_step * 3.5, 3.0)
+    splat_r = max(1.0, median_step * 0.9 * stamp_stride)
 
-    median_step = sorted(step_dists)[len(step_dists) // 2] if step_dists else px_step
-    median_across = sorted(across_dists)[len(across_dists) // 2] if across_dists else px_step
-    # Quads that jump farther than this are treated as UV seams and skipped
-    max_tri_edge = max(median_step * 5.0, median_across * 6.0, width_px * 0.85, px_step * 8.0, 8.0)
-    max_tri_edge = min(max_tri_edge, max(img_w, img_h) * 0.4)
-
-    # Solid UV-quad fill between neighboring lanes — no soft stamp striping
-    solid_rgba = None if tex_pxs is not None else color
-    filled_px = 0
-    seg_count = n_len if cyclic else max(n_len - 1, 0)
-    for i in range(seg_count):
-        i1 = (i + 1) % n_len if cyclic else i + 1
-        if not cyclic and i1 >= n_len:
-            break
-        for j in range(n_width - 1):
-            a = lanes[j][i]
-            b = lanes[j + 1][i]
-            c = lanes[j + 1][i1]
-            d = lanes[j][i1]
-            if a is None or b is None or c is None or d is None:
-                continue
-            # Two triangles: A-B-C and A-C-D
-            attr_a = (a[1], a[2])
-            attr_b = (b[1], b[2])
-            attr_c = (c[1], c[2])
-            attr_d = (d[1], d[2])
-            filled_px += _fill_ribbon_tri(
-                pxs, img_w, img_h, a[0], b[0], c[0], attr_a, attr_b, attr_c,
-                _rgba_at, falloff, max_tri_edge, solid_rgba=solid_rgba
-            )
-            filled_px += _fill_ribbon_tri(
-                pxs, img_w, img_h, a[0], c[0], d[0], attr_a, attr_c, attr_d,
-                _rgba_at, falloff, max_tri_edge, solid_rgba=solid_rgba
-            )
+    def _bridge(sample_a, sample_b, wrap_u=False):
+        nonlocal stamps
+        if sample_a is None or sample_b is None:
+            return
+        uv, u_len, v_across, strength = sample_a
+        uv2, u_len2, v_across2, strength2 = sample_b
+        dist_px = _uv_pixel_dist(uv, uv2, img_w, img_h)
+        # Large UV jumps = different island / seam — stamp endpoints only, do not draw a chord
+        if dist_px > max_bridge_px:
+            return
+        if dist_px < 0.35:
+            return
+        steps = max(1, int(math.ceil(dist_px / bridge_step)))
+        u_b = u_len2
+        if wrap_u and u_b + 1e-6 < u_len:
+            u_b += 1.0
+        for s in range(1, steps):
+            t = s / float(steps)
+            uv_i = uv.lerp(uv2, t)
+            u_i = u_len * (1.0 - t) + u_b * t
+            v_i = v_across * (1.0 - t) + v_across2 * t
+            str_i = strength * (1.0 - t) + strength2 * t
+            _splat_rgba(pxs, img_w, img_h, uv_i.x, uv_i.y, _rgba_at(u_i, v_i), str_i, radius_px=splat_r)
             stamps += 1
 
-    if stamps == 0 or filled_px == 0:
+    for j in range(n_width):
+        lane = lanes[j]
+        for i in range(n_len):
+            sample = lane[i]
+            if sample is None:
+                continue
+            uv, u_len, v_across, strength = sample
+            _splat_rgba(pxs, img_w, img_h, uv.x, uv.y, _rgba_at(u_len, v_across), strength, radius_px=splat_r)
+            stamps += 1
+            if fill_gaps and i + 1 < n_len:
+                _bridge(sample, lane[i + 1], wrap_u=False)
+        if cyclic and fill_gaps and n_len >= 2:
+            _bridge(lane[-1], lane[0], wrap_u=True)
+
+    # Also bridge across width on the same path sample (fills ribbon body on each island)
+    if fill_gaps:
+        for i in range(n_len):
+            for j in range(n_width - 1):
+                _bridge(lanes[j][i], lanes[j + 1][i], wrap_u=False)
+
+    if stamps == 0:
         return False, 'No path samples projected onto the mesh (move the curve closer to the surface)'
 
     flat = pxs.ravel()
@@ -1503,8 +1349,8 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
     image.update()
 
     suffix = ', cyclic' if cyclic else ''
-    return True, 'Baked path ribbon (%d quads, %d px, res %d x %d, quality %s%s)' % (
-        stamps, filled_px, n_len, n_width, quality, suffix
+    return True, 'Baked %d path stamps (res %d x %d, quality %s%s)' % (
+        stamps, n_len, n_width, quality, suffix
     )
 
 def _poll_curve_object(self, obj):
@@ -1575,9 +1421,9 @@ class BaseBakePath():
 
     path_bake_quality : EnumProperty(
         name = 'Bake Quality',
-        description = 'Low is fastest/coarser; Ultra is denser/slower. Width Multiplier × Radius sets thickness',
+        description = 'Trade bake speed for edge quality. Width Multiplier × Radius sets thickness; this controls sampling density',
         items = (
-            ('LOW', 'Low', 'Fastest — fewer samples, slightly coarser edges'),
+            ('LOW', 'Low', 'Fastest bake, coarser edges'),
             ('MEDIUM', 'Medium', 'Balanced speed and quality'),
             ('HIGH', 'High', 'Cleaner edges, slower'),
             ('ULTRA', 'Ultra', 'Densest sampling, slowest'),
