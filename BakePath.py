@@ -468,6 +468,11 @@ def _sample_evaluated_curve(curve_obj, resolution):
     except Exception:
         return points
 
+def _curve_is_cyclic(curve_obj):
+    if not curve_obj or curve_obj.type != 'CURVE' or not curve_obj.data:
+        return False
+    return any(getattr(s, 'use_cyclic_u', False) for s in curve_obj.data.splines)
+
 def _curve_to_polyline(curve_obj, resolution=64):
     '''Return world-space polyline points sampled from a CURVE object.'''
     # When Shrinkwrap is on, sample evaluated / projected geometry so baking follows the surface
@@ -489,12 +494,17 @@ def _sample_bezier_math(curve_obj, resolution):
     mw = curve_obj.matrix_world
     points = []
     curve = curve_obj.data
+    any_cyclic = False
 
     for spline in curve.splines:
         if spline.type != 'BEZIER':
             # Poly / NURBS: use control points as coarse polyline
             pts = [mw @ Vector(p.co[:3]) for p in spline.points]
             points.extend(pts)
+            if getattr(spline, 'use_cyclic_u', False) and len(pts) >= 2:
+                any_cyclic = True
+                # Include closing segment so resample covers the full loop
+                points.append(pts[0].copy())
             continue
 
         bps = spline.bezier_points
@@ -504,6 +514,7 @@ def _sample_bezier_math(curve_obj, resolution):
         segs = len(bps) - 1
         if spline.use_cyclic_u:
             segs = len(bps)
+            any_cyclic = True
 
         samples_per_seg = max(2, resolution // max(segs, 1))
 
@@ -522,7 +533,11 @@ def _sample_bezier_math(curve_obj, resolution):
 
     if len(points) < 2:
         return []
-    return _resample_polyline(points, resolution)
+    points = _resample_polyline(points, resolution)
+    # Cyclic ribbons bake as an open ring of unique samples; the close is bridged later
+    if any_cyclic and len(points) >= 2 and (points[0] - points[-1]).length < 1e-4:
+        points = points[:-1]
+    return points
 
 def _bezier_point(p0, p1, p2, p3, t):
     u = 1.0 - t
@@ -1012,6 +1027,12 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
     if len(polyline) < 2:
         return False, 'Curve has too few points to bake'
     width_samples = max(width_samples, 2)
+    cyclic = _curve_is_cyclic(curve_obj)
+    # Evaluated/shrinkwrap sampling can leave a duplicate close point
+    if cyclic and len(polyline) >= 3 and (polyline[0] - polyline[-1]).length < 1e-4:
+        polyline = polyline[:-1]
+    if len(polyline) < 2:
+        return False, 'Curve has too few points to bake'
 
     # Max search distance: generous default based on object size + path width
     if project_distance is None:
@@ -1052,7 +1073,11 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
 
     for i in range(n_len):
         p = polyline[i]
-        if i == 0:
+        if cyclic and n_len >= 3:
+            prev_p = polyline[(i - 1) % n_len]
+            next_p = polyline[(i + 1) % n_len]
+            tangent = next_p - prev_p
+        elif i == 0:
             tangent = (polyline[1] - polyline[0])
         elif i == n_len - 1:
             tangent = (polyline[-1] - polyline[-2])
@@ -1078,7 +1103,7 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
                 side = tangent.cross(Vector((0, 1, 0)))
         side.normalize()
 
-        u_len = i / float(n_len - 1)
+        u_len = i / float(max(n_len - 1, 1))
         # Lift along normal so creases on low-poly meshes still find a surface hit
         lift = max(half_w * 0.35, project_distance * 0.01)
 
@@ -1116,6 +1141,28 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
             )
         return color
 
+    def _bridge_samples(sample_a, sample_b):
+        nonlocal stamps
+        if sample_a is None or sample_b is None:
+            return
+        uv, u_len, v_across, strength = sample_a
+        uv2, u_len2, v_across2, strength2 = sample_b
+        dist_px = _uv_pixel_dist(uv, uv2, img_w, img_h)
+        if dist_px < 0.5 or dist_px > seam_px:
+            # Too close (already covered) or UV seam jump — don't interpolate
+            return
+        steps = int(math.ceil(dist_px))
+        radius = max(1.0, dist_px / max(steps, 1) * 0.9)
+        for s in range(1, steps):
+            t = s / float(steps)
+            uv_i = uv.lerp(uv2, t)
+            u_i = u_len * (1.0 - t) + u_len2 * t
+            v_i = v_across * (1.0 - t) + v_across2 * t
+            str_i = strength * (1.0 - t) + strength2 * t
+            rgba_i = _rgba_at(u_i, v_i)
+            _splat_rgba(pxs, img_w, img_h, uv_i.x, uv_i.y, rgba_i, str_i, radius_px=radius)
+            stamps += 1
+
     # Stamp each lane, bridging gaps in UV space between consecutive hits
     for lane in lanes:
         for i, sample in enumerate(lane):
@@ -1126,30 +1173,13 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
             _splat_rgba(pxs, img_w, img_h, uv.x, uv.y, rgba, strength, radius_px=1.25)
             stamps += 1
 
-            if not fill_gaps or i + 1 >= len(lane):
+            if not fill_gaps:
                 continue
-            nxt = lane[i + 1]
-            if nxt is None:
-                continue
-
-            uv2, u_len2, v_across2, strength2 = nxt
-            dist_px = _uv_pixel_dist(uv, uv2, img_w, img_h)
-            if dist_px < 0.5 or dist_px > seam_px:
-                # Too close (already covered) or UV seam jump — don't interpolate
-                continue
-
-            steps = int(math.ceil(dist_px))
-            # Brush radius scales with spacing so the ribbon stays continuous
-            radius = max(1.0, dist_px / max(steps, 1) * 0.9)
-            for s in range(1, steps):
-                t = s / float(steps)
-                uv_i = uv.lerp(uv2, t)
-                u_i = u_len * (1.0 - t) + u_len2 * t
-                v_i = v_across * (1.0 - t) + v_across2 * t
-                str_i = strength * (1.0 - t) + strength2 * t
-                rgba_i = _rgba_at(u_i, v_i)
-                _splat_rgba(pxs, img_w, img_h, uv_i.x, uv_i.y, rgba_i, str_i, radius_px=radius)
-                stamps += 1
+            if i + 1 < len(lane):
+                _bridge_samples(sample, lane[i + 1])
+            elif cyclic and len(lane) >= 3:
+                # Close the loop: bridge last sample back to the first
+                _bridge_samples(sample, lane[0])
 
     if stamps == 0:
         return False, 'No path samples projected onto the mesh (move the curve closer to the surface)'
