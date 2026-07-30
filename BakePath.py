@@ -914,6 +914,115 @@ def _nearest_uv(bvh, tris, point, max_dist=None):
 
     return loc, n, Vector((uv.x, uv.y)), dist
 
+def _uv_from_tri_hit(tris, loc, normal, index, dist):
+    if index < 0 or index >= len(tris):
+        return None
+    v0, v1, v2, uv0, uv1, uv2, face_n = tris[index]
+    try:
+        uv = _barycentric_uv(loc, v0, v1, v2, uv0, uv1, uv2)
+    except Exception:
+        uv = (uv0 + uv1 + uv2) / 3.0
+    n = face_n if face_n.length > 1e-8 else Vector(normal)
+    if n.length > 1e-8:
+        n.normalize()
+    else:
+        n = Vector((0, 0, 1))
+    return loc, n, Vector((uv.x, uv.y)), dist
+
+def _raycast_uv_along_dir(bvh, tris, point, direction, max_dist):
+    '''
+    Raycast ± along direction (shape plane normal) and return the closest hit UV.
+    Matches Shrinkwrap Project with +/- and no axis.
+    '''
+    if direction.length < 1e-8:
+        return None
+    d = direction.normalized()
+    max_dist = float(max_dist) if max_dist is not None else 1.0
+    best = None
+    for sign in (1.0, -1.0):
+        # Start slightly behind the point so coplanar/on-surface points still hit
+        origin = point - d * sign * min(max_dist * 0.001, 1e-4)
+        try:
+            hit = bvh.ray_cast(origin, d * sign, max_dist)
+        except Exception:
+            hit = None
+        if not hit or hit[0] is None:
+            continue
+        loc, normal, index, dist = hit
+        # Distance from original point
+        dist_from_p = (Vector(loc) - point).length
+        if best is None or dist_from_p < best[3]:
+            mapped = _uv_from_tri_hit(tris, Vector(loc), normal, index, dist_from_p)
+            if mapped:
+                best = mapped
+    return best
+
+def _project_shape_polyline_project_to_uv(polyline, bvh, tris, project_distance):
+    '''
+    Project-mode UV mapping: raycast each authored point along the shape plane
+    normal (±). Misses (overhang past the mesh) are filled with a plane->UV
+    affine trained only on successful ray hits.
+
+    Avoids the old full-affine path that warped multi-island / non-linear UVs
+    into fan-shaped garbage.
+    '''
+    if len(polyline) < 3:
+        return [], 0
+
+    center, axis_u, axis_v, plane_n = _fit_polyline_plane(polyline)
+
+    def to_plane(p):
+        d = p - center
+        return (d.dot(axis_u), d.dot(axis_v))
+
+    uvs = [None] * len(polyline)
+    fit_pts = []
+    fit_uvs = []
+    seam_jumps = 0
+    prev_uv = None
+    for i, p in enumerate(polyline):
+        hit = _raycast_uv_along_dir(bvh, tris, p, plane_n, project_distance)
+        if not hit:
+            continue
+        _loc, _n, uv, _dist = hit
+        uvs[i] = uv.copy()
+        fit_pts.append(p)
+        fit_uvs.append(uv)
+        if prev_uv is not None and (uv - prev_uv).length > 0.25:
+            seam_jumps += 1
+        prev_uv = uv
+
+    misses = [i for i, uv in enumerate(uvs) if uv is None]
+    xu = xv = None
+    if misses and len(fit_pts) >= 3:
+        A = numpy.array([[to_plane(p)[0], to_plane(p)[1], 1.0] for p in fit_pts], dtype=numpy.float64)
+        bu = numpy.array([uv.x for uv in fit_uvs], dtype=numpy.float64)
+        bv = numpy.array([uv.y for uv in fit_uvs], dtype=numpy.float64)
+        try:
+            xu, _, _, _ = numpy.linalg.lstsq(A, bu, rcond=None)
+            xv, _, _, _ = numpy.linalg.lstsq(A, bv, rcond=None)
+        except Exception:
+            xu = xv = None
+
+    if xu is not None and xv is not None:
+        for i in misses:
+            s, t = to_plane(polyline[i])
+            uvs[i] = Vector((
+                float(xu[0] * s + xu[1] * t + xu[2]),
+                float(xv[0] * s + xv[1] * t + xv[2]),
+            ))
+
+    # Any remaining gaps: nearest as last resort (keeps polygon closed)
+    out = []
+    for i, p in enumerate(polyline):
+        if uvs[i] is not None:
+            out.append(uvs[i])
+            continue
+        hit = _nearest_uv(bvh, tris, p, max_dist=project_distance)
+        if hit:
+            out.append(hit[2].copy())
+    return out, seam_jumps
+
 def _barycentric_uv(p, a, b, c, uva, uvb, uvc):
     v0 = b - a
     v1 = c - a
@@ -1127,13 +1236,10 @@ def _fit_polyline_plane(polyline):
 def _project_shape_polyline_to_uv(polyline, bvh, tris, project_distance,
                                   preserve_silhouette=False):
     '''
-    Map a closed world-space shape into UV continuously.
+    Map a closed world-space shape into UV continuously (Nearest / hybrid).
 
-    preserve_silhouette=False (Nearest / hybrid):
-      On-mesh points keep nearest UVs; clear overhangs use plane->UV affine.
-    preserve_silhouette=True (Project):
-      Always map the full authored outline through plane->UV affine so the bake
-      matches the Project curve instead of collapsing like Nearest.
+    On-mesh points keep nearest UVs; clear overhangs use plane->UV affine.
+    For Project mode prefer _project_shape_polyline_project_to_uv (raycast).
     '''
     if len(polyline) < 3:
         return [], 0
@@ -1501,9 +1607,9 @@ def bake_shape_to_image(obj, image, curve_obj, uv_name, resolution,
     for li, polyline in enumerate(source_loops):
         authored = authored_loops[li] if li < len(authored_loops) else polyline
         if use_project:
-            # Full plane->UV affine — do not nearest-collapse (that looked like Nearest bake)
-            uvs, jumps = _project_shape_polyline_to_uv(
-                authored, bvh, tris, project_distance, preserve_silhouette=True
+            # Raycast ± along shape plane normal (true Project); affine only for misses
+            uvs, jumps = _project_shape_polyline_project_to_uv(
+                authored, bvh, tris, project_distance
             )
         else:
             use_overhang = len(authored) >= 3 and _count_overhang(authored) >= 3
