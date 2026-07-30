@@ -3249,6 +3249,10 @@ def update_layer_index(self, context):
     for ob in objs:
         refresh_temp_uv(ob, entity)
 
+    # Path/shape layers: selecting the layer also selects its linked curve
+    from . import BakePath
+    BakePath.schedule_sync_active_layer_to_path_curve(yp)
+
     #update_image_editor_image(context, image)
 
 def update_channel_colorspace(self, context):

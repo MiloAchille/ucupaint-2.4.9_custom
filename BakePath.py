@@ -103,10 +103,13 @@ def select_path_bake_layer_for_curve(curve_obj):
 
 _last_path_curve_layer_sync = None
 _pending_path_curve_layer_sync = None
+_pending_layer_to_curve_tree = None
+_last_layer_to_curve_key = None
+_path_sel_sync_lock = False
 
 def _deferred_path_curve_layer_sync():
     '''Timer callback — RNA writes are unsafe directly from depsgraph/msgbus.'''
-    global _pending_path_curve_layer_sync, _last_path_curve_layer_sync
+    global _pending_path_curve_layer_sync, _last_path_curve_layer_sync, _path_sel_sync_lock
     curve_obj = _pending_path_curve_layer_sync
     _pending_path_curve_layer_sync = None
     if not curve_obj:
@@ -117,8 +120,12 @@ def _deferred_path_curve_layer_sync():
     except ReferenceError:
         _last_path_curve_layer_sync = None
         return None
-    if select_path_bake_layer_for_curve(curve_obj):
-        _last_path_curve_layer_sync = curve_obj.as_pointer() if hasattr(curve_obj, 'as_pointer') else curve_obj.name
+    _path_sel_sync_lock = True
+    try:
+        if select_path_bake_layer_for_curve(curve_obj):
+            _last_path_curve_layer_sync = curve_obj.as_pointer() if hasattr(curve_obj, 'as_pointer') else curve_obj.name
+    finally:
+        _path_sel_sync_lock = False
     return None
 
 def sync_active_path_curve_layer_selection():
@@ -127,6 +134,8 @@ def sync_active_path_curve_layer_selection():
     Safe to call from msgbus / depsgraph handlers (defers the actual write).
     '''
     global _last_path_curve_layer_sync, _pending_path_curve_layer_sync
+    if _path_sel_sync_lock:
+        return
     try:
         obj = bpy.context.object
     except Exception:
@@ -148,6 +157,91 @@ def sync_active_path_curve_layer_selection():
     _pending_path_curve_layer_sync = obj
     if not bpy.app.timers.is_registered(_deferred_path_curve_layer_sync):
         bpy.app.timers.register(_deferred_path_curve_layer_sync, first_interval=0.0)
+
+def _select_only_object(obj):
+    if not obj:
+        return
+    try:
+        selected = list(bpy.context.selected_objects)
+    except Exception:
+        selected = []
+    for o in selected:
+        if o != obj:
+            set_object_select(o, False)
+    set_object_select(obj, True)
+    set_active_object(obj)
+
+def _deferred_layer_to_curve_sync():
+    '''When a path/shape layer becomes active, select its curve (and vice versa leave).'''
+    global _pending_layer_to_curve_tree, _last_path_curve_layer_sync, _path_sel_sync_lock
+    tree = _pending_layer_to_curve_tree
+    _pending_layer_to_curve_tree = None
+    if not tree or _path_sel_sync_lock:
+        return None
+    yp = getattr(tree, 'yp', None)
+    if not yp or getattr(yp, 'halt_update', False):
+        return None
+    if len(yp.layers) == 0 or yp.active_layer_index < 0 or yp.active_layer_index >= len(yp.layers):
+        return None
+
+    layer = yp.layers[yp.active_layer_index]
+    curve_obj = None
+    if getattr(layer, 'enable_path_bake', False):
+        curve_obj = get_path_curve_object(layer)
+
+    try:
+        active = bpy.context.object
+    except Exception:
+        active = None
+
+    mesh = None
+    if curve_obj and curve_obj.parent and curve_obj.parent.type == 'MESH':
+        mesh = curve_obj.parent
+    elif active:
+        if active.type == 'MESH':
+            mesh = active
+        elif active.type == 'CURVE' and active.parent and active.parent.type == 'MESH':
+            mesh = active.parent
+
+    _path_sel_sync_lock = True
+    try:
+        if curve_obj:
+            if active != curve_obj:
+                _select_only_object(curve_obj)
+            _last_path_curve_layer_sync = (
+                curve_obj.as_pointer() if hasattr(curve_obj, 'as_pointer') else curve_obj.name
+            )
+        else:
+            # Left a path/shape layer: if a linked path curve is active, return to the mesh
+            if active and active.type == 'CURVE':
+                linked_yp, _idx = find_path_bake_layer_for_curve(active)
+                if linked_yp is not None and mesh:
+                    _select_only_object(mesh)
+            _last_path_curve_layer_sync = None
+    finally:
+        _path_sel_sync_lock = False
+    return None
+
+def schedule_sync_active_layer_to_path_curve(yp):
+    '''Defer layer→curve object selection (safe from active_layer_index update).'''
+    global _pending_layer_to_curve_tree, _last_layer_to_curve_key
+    if _path_sel_sync_lock or not yp:
+        return
+    if getattr(yp, 'halt_update', False):
+        return
+    tree = getattr(yp, 'id_data', None)
+    if not tree:
+        return
+    # Skip no-op refreshes (yp.active_layer_index = yp.active_layer_index)
+    # so paint-slot updates don't keep yanking selection onto the curve.
+    tree_key = tree.as_pointer() if hasattr(tree, 'as_pointer') else id(tree)
+    key = (tree_key, int(yp.active_layer_index))
+    if key == _last_layer_to_curve_key:
+        return
+    _last_layer_to_curve_key = key
+    _pending_layer_to_curve_tree = tree
+    if not bpy.app.timers.is_registered(_deferred_layer_to_curve_sync):
+        bpy.app.timers.register(_deferred_layer_to_curve_sync, first_interval=0.0)
 
 def resolve_path_bake_mesh(obj=None):
     '''Return a mesh suitable for path/shape baking from the active or given object.'''
@@ -227,13 +321,14 @@ def duplicate_path_curve_for_layer(layer, duplicated_curves=None):
 
         # Keep shrinkwrap targeting the same mesh (parent / existing target)
         if getattr(layer, 'path_enable_shrinkwrap', True):
+            method = _layer_shrinkwrap_method(layer)
             target = new_curve.parent
             if target and target.type == 'MESH':
-                ensure_path_shrinkwrap(new_curve, target)
+                ensure_path_shrinkwrap(new_curve, target, method=method)
             else:
                 mod = get_path_shrinkwrap_modifier(new_curve)
                 if mod and mod.target:
-                    ensure_path_shrinkwrap(new_curve, mod.target)
+                    ensure_path_shrinkwrap(new_curve, mod.target, method=method)
 
     set_path_curve_object(layer, new_curve)
     return new_curve
@@ -250,10 +345,24 @@ def get_path_shrinkwrap_modifier(curve_obj):
             return mod
     return None
 
-def configure_path_shrinkwrap(mod, target_obj):
-    '''Apply the standard path shrinkwrap settings.'''
+def configure_path_shrinkwrap(mod, target_obj, method='NEAREST_SURFACEPOINT'):
+    '''Apply path shrinkwrap settings (Nearest Surface Point or Project +/-).'''
     mod.target = target_obj
-    mod.wrap_method = 'NEAREST_SURFACEPOINT'
+    if method == 'PROJECT':
+        mod.wrap_method = 'PROJECT'
+        if hasattr(mod, 'use_negative_direction'):
+            mod.use_negative_direction = True
+        if hasattr(mod, 'use_positive_direction'):
+            mod.use_positive_direction = True
+        # No project axes — match Blender Project setup with only +/- directions
+        if hasattr(mod, 'use_project_x'):
+            mod.use_project_x = False
+        if hasattr(mod, 'use_project_y'):
+            mod.use_project_y = False
+        if hasattr(mod, 'use_project_z'):
+            mod.use_project_z = False
+    else:
+        mod.wrap_method = 'NEAREST_SURFACEPOINT'
     if hasattr(mod, 'wrap_mode'):
         mod.wrap_mode = 'ON_SURFACE'
     mod.offset = 0.0
@@ -264,7 +373,7 @@ def configure_path_shrinkwrap(mod, target_obj):
     if hasattr(mod, 'show_on_cage'):
         mod.show_on_cage = True
 
-def ensure_path_shrinkwrap(curve_obj, target_obj=None):
+def ensure_path_shrinkwrap(curve_obj, target_obj=None, method='NEAREST_SURFACEPOINT'):
     '''Add or update Shrinkwrap on the path curve, targeting the parent mesh.'''
     if not curve_obj or curve_obj.type != 'CURVE':
         return None
@@ -278,7 +387,7 @@ def ensure_path_shrinkwrap(curve_obj, target_obj=None):
         mod = curve_obj.modifiers.new(PATH_SHRINKWRAP_NAME, 'SHRINKWRAP')
     elif mod.name != PATH_SHRINKWRAP_NAME:
         mod.name = PATH_SHRINKWRAP_NAME
-    configure_path_shrinkwrap(mod, target_obj)
+    configure_path_shrinkwrap(mod, target_obj, method=method)
     return mod
 
 def remove_path_shrinkwrap(curve_obj):
@@ -289,6 +398,9 @@ def remove_path_shrinkwrap(curve_obj):
     for mod in to_remove:
         curve_obj.modifiers.remove(mod)
 
+def _layer_shrinkwrap_method(layer):
+    return getattr(layer, 'path_shrinkwrap_method', 'NEAREST_SURFACEPOINT') or 'NEAREST_SURFACEPOINT'
+
 def update_path_enable_shrinkwrap(self, context):
     curve_obj = get_path_curve_object(self)
     if not curve_obj:
@@ -296,16 +408,28 @@ def update_path_enable_shrinkwrap(self, context):
     if self.path_enable_shrinkwrap:
         target = curve_obj.parent if curve_obj.parent else context.object
         if target and target.type == 'MESH':
-            ensure_path_shrinkwrap(curve_obj, target)
+            ensure_path_shrinkwrap(curve_obj, target, method=_layer_shrinkwrap_method(self))
     else:
         remove_path_shrinkwrap(curve_obj)
 
-def create_path_curve(target_obj, name='Path', use_shrinkwrap=True, cyclic=False):
+def update_path_shrinkwrap_method(self, context):
+    '''Re-apply shrinkwrap when Nearest / Project mode changes.'''
+    if not getattr(self, 'path_enable_shrinkwrap', False):
+        return
+    curve_obj = get_path_curve_object(self)
+    if not curve_obj:
+        return
+    target = curve_obj.parent if curve_obj.parent else getattr(context, 'object', None)
+    if target and target.type == 'MESH':
+        ensure_path_shrinkwrap(curve_obj, target, method=_layer_shrinkwrap_method(self))
+
+def create_path_curve(target_obj, name='Path', use_shrinkwrap=True, cyclic=False,
+                      shrinkwrap_method='NEAREST_SURFACEPOINT'):
     scene = bpy.context.scene
     curve_name = get_unique_name(name, bpy.data.objects)
     curve_data = bpy.data.curves.new(curve_name, type='CURVE')
     curve_data.dimensions = '3D'
-    curve_data.resolution_u = 12
+    curve_data.resolution_u = 64
 
     spline = curve_data.splines.new('BEZIER')
 
@@ -385,7 +509,7 @@ def create_path_curve(target_obj, name='Path', use_shrinkwrap=True, cyclic=False
     curve_obj.matrix_parent_inverse = target_obj.matrix_world.inverted()
 
     if use_shrinkwrap:
-        ensure_path_shrinkwrap(curve_obj, target_obj)
+        ensure_path_shrinkwrap(curve_obj, target_obj, method=shrinkwrap_method)
 
     return curve_obj
 
@@ -432,11 +556,17 @@ def _sample_evaluated_curve(curve_obj, resolution):
         remove_datablock(bpy.data.meshes, mesh)
 
     # Curves often don't convert to a useful mesh without bevel.
-    # Emulate Nearest Surface Point shrinkwrap for bake sampling.
+    # Emulate Shrinkwrap for bake sampling.
     mod = get_path_shrinkwrap_modifier(curve_obj)
     target = mod.target if mod else None
     points = _sample_bezier_math(curve_obj, resolution)
     if not target or target.type != 'MESH' or len(points) < 2:
+        return points
+
+    wrap_method = getattr(mod, 'wrap_method', 'NEAREST_SURFACEPOINT')
+    # Project with no axes does not move points in Blender — keep authored silhouette.
+    # Nearest snaps each sample to the closest surface point.
+    if wrap_method == 'PROJECT':
         return points
 
     try:
@@ -951,8 +1081,71 @@ def _decimate_poly(poly, max_points=96):
     out = [poly[int(i * step) % n] for i in range(max_points)]
     return out
 
+def _densify_poly_edges(poly, max_edge_px=2.0):
+    '''Subdivide long polygon edges so scanline fill follows the outline tightly.'''
+    n = len(poly)
+    if n < 3:
+        return poly
+    out = []
+    max_edge = max(0.5, float(max_edge_px))
+    for i in range(n):
+        x0, y0 = poly[i]
+        x1, y1 = poly[(i + 1) % n]
+        out.append((x0, y0))
+        dx = x1 - x0
+        dy = y1 - y0
+        dist = math.sqrt(dx * dx + dy * dy)
+        if dist <= max_edge:
+            continue
+        steps = int(math.ceil(dist / max_edge))
+        for s in range(1, steps):
+            t = s / float(steps)
+            out.append((x0 + dx * t, y0 + dy * t))
+    return out
+
+def _inflate_poly(poly, amount_px):
+    '''Push polygon vertices outward along averaged edge normals (pixel space).'''
+    n = len(poly)
+    if n < 3 or abs(amount_px) < 1e-8:
+        return poly
+
+    # Signed area to know winding. Image Y grows downward, so the geometric
+    # left-of-edge normal for a CCW poly points inward — flip for outward.
+    area = 0.0
+    for i in range(n):
+        x0, y0 = poly[i]
+        x1, y1 = poly[(i + 1) % n]
+        area += x0 * y1 - x1 * y0
+    sign = -1.0 if area >= 0.0 else 1.0
+
+    out = []
+    for i in range(n):
+        x_prev, y_prev = poly[(i - 1) % n]
+        x, y = poly[i]
+        x_next, y_next = poly[(i + 1) % n]
+
+        e0x, e0y = x - x_prev, y - y_prev
+        e1x, e1y = x_next - x, y_next - y
+        l0 = math.sqrt(e0x * e0x + e0y * e0y) or 1.0
+        l1 = math.sqrt(e1x * e1x + e1y * e1y) or 1.0
+        # Inward normals of incoming/outgoing edges, then flip to outward
+        n0x, n0y = -sign * e0y / l0, sign * e0x / l0
+        n1x, n1y = -sign * e1y / l1, sign * e1x / l1
+        nx, ny = n0x + n1x, n0y + n1y
+        nl = math.sqrt(nx * nx + ny * ny)
+        if nl < 1e-8:
+            nx, ny = n0x, n0y
+            nl = math.sqrt(nx * nx + ny * ny) or 1.0
+        nx /= nl
+        ny /= nl
+        out.append((x + nx * amount_px, y + ny * amount_px))
+    return out
+
 def _scanline_fill_mask(poly, img_w, img_h, min_x, max_x, min_y, max_y):
-    '''Fast even-odd scanline fill into a float mask (img_h, img_w).'''
+    '''Fast even-odd scanline fill into a float mask (img_h, img_w).
+
+    Uses pixel-center coverage on both axes (x+0.5, y+0.5).
+    '''
     mask = numpy.zeros((img_h, img_w), dtype=numpy.float32)
     n = len(poly)
     if n < 3:
@@ -979,8 +1172,9 @@ def _scanline_fill_mask(poly, img_w, img_h, min_x, max_x, min_y, max_y):
             x_b = hits[k + 1]
             if x_b < x_a:
                 x_a, x_b = x_b, x_a
-            x0 = max(min_x, int(math.ceil(x_a)))
-            x1 = min(max_x, int(math.floor(x_b)))
+            # Pixel x is covered when its center x+0.5 lies strictly inside (x_a, x_b)
+            x0 = max(min_x, int(math.ceil(x_a - 0.5)))
+            x1 = min(max_x, int(math.floor(x_b - 0.5)))
             if x1 >= x0:
                 mask[y, x0:x1 + 1] = 1.0
     return mask
@@ -1032,8 +1226,8 @@ def bake_shape_to_image(obj, image, curve_obj, uv_name, resolution,
     if img_w < 1 or img_h < 1:
         return False, 'Invalid image size'
 
-    # Shapes don't need hundreds of outline samples — cap for speed/quality balance
-    shape_res = min(max(int(resolution), 16), 96)
+    # Use path resolution for shapes too (was hard-capped at 96 → soft/short edges)
+    shape_res = min(max(int(resolution), 32), 1024)
 
     # Authored silhouette preserves overhang past the mesh. Evaluated / shrinkwrap
     # silhouette matches the viewport for shapes that sit fully on the surface.
@@ -1095,14 +1289,22 @@ def bake_shape_to_image(obj, image, curve_obj, uv_name, resolution,
     if len(uvs) < 3:
         return False, 'Shape UV polygon is degenerate'
 
-    # Pixel-space polygon (decimate again in case projection kept many points)
-    poly = [(uv.x * (img_w - 1), uv.y * (img_h - 1)) for uv in uvs]
-    poly = _decimate_poly(poly, max_points=96)
+    # Pixel-space polygon. Use uv * size so texel centers match Blender sampling
+    # (uv*(size-1) slightly shrinks shapes toward the UV origin).
+    poly = [(uv.x * img_w, uv.y * img_h) for uv in uvs]
+    max_poly = min(max(shape_res, 64), 1024)
+    poly = _decimate_poly(poly, max_points=max_poly)
+    poly = _densify_poly_edges(poly, max_edge_px=1.5)
+
+    feather = max(0.0, float(feather_px))
+    # Hard fills: nudge outline out by half a pixel so mesh-edge windows don't
+    # leave a white fringe from subpixel underfill / inset shrinkwrap.
+    if feather <= 0.5:
+        poly = _inflate_poly(poly, 0.6)
 
     xs = [p[0] for p in poly]
     ys = [p[1] for p in poly]
-    feather = max(0.0, float(feather_px))
-    pad = int(math.ceil(feather)) + 1
+    pad = int(math.ceil(max(feather, 0.6))) + 2
     min_x = max(0, int(math.floor(min(xs) - pad)))
     max_x = min(img_w - 1, int(math.ceil(max(xs) + pad)))
     min_y = max(0, int(math.floor(min(ys) - pad)))
@@ -1426,9 +1628,20 @@ class BaseBakePath():
 
     path_enable_shrinkwrap : BoolProperty(
         name = 'Shrinkwrap to Mesh',
-        description = 'Add a Shrinkwrap modifier on the path curve targeting the parent mesh (Nearest Surface Point)',
+        description = 'Add a Shrinkwrap modifier on the path curve targeting the parent mesh',
         default = True,
         update = update_path_enable_shrinkwrap
+    )
+
+    path_shrinkwrap_method : EnumProperty(
+        name = 'Shrinkwrap Method',
+        description = 'How the path curve sticks to the mesh',
+        items = (
+            ('NEAREST_SURFACEPOINT', 'Nearest', 'Nearest Surface Point (snap to closest mesh location)'),
+            ('PROJECT', 'Project', 'Shrinkwrap Project (+/- directions, no axis)'),
+        ),
+        default = 'NEAREST_SURFACEPOINT',
+        update = update_path_shrinkwrap_method
     )
 
     if is_bl_newer_than(2, 79):
@@ -1620,7 +1833,8 @@ class YNewPathLayer(bpy.types.Operator):
         is_shape = self.path_mode == 'SHAPE'
         curve_label = self.name + (' Shape' if is_shape else ' Curve')
         curve_obj = create_path_curve(
-            obj, name=curve_label, use_shrinkwrap=True, cyclic=is_shape
+            obj, name=curve_label, use_shrinkwrap=True, cyclic=is_shape,
+            shrinkwrap_method='NEAREST_SURFACEPOINT'
         )
 
         from . import Layer
@@ -1635,9 +1849,10 @@ class YNewPathLayer(bpy.types.Operator):
         layer.enable_path_bake = True
         layer.path_mode = self.path_mode
         layer.path_enable_shrinkwrap = True
+        layer.path_shrinkwrap_method = 'NEAREST_SURFACEPOINT'
         set_path_curve_object(layer, curve_obj)
         layer.path_width = self.path_width
-        ensure_path_shrinkwrap(curve_obj, obj)
+        ensure_path_shrinkwrap(curve_obj, obj, method=layer.path_shrinkwrap_method)
         if is_shape:
             ensure_curve_cyclic(curve_obj, True)
 
@@ -1891,12 +2106,13 @@ class YCreatePathCurveForLayer(bpy.types.Operator):
             obj,
             name=layer.name + (' Shape' if is_shape else ' Curve'),
             use_shrinkwrap=layer.path_enable_shrinkwrap,
-            cyclic=is_shape
+            cyclic=is_shape,
+            shrinkwrap_method=_layer_shrinkwrap_method(layer)
         )
         layer.enable_path_bake = True
         set_path_curve_object(layer, curve_obj)
         if layer.path_enable_shrinkwrap:
-            ensure_path_shrinkwrap(curve_obj, obj)
+            ensure_path_shrinkwrap(curve_obj, obj, method=_layer_shrinkwrap_method(layer))
         if is_shape:
             ensure_curve_cyclic(curve_obj, True)
 
@@ -1942,7 +2158,11 @@ def draw_path_bake_ui(layout, context, layer):
     else:
         brow.operator('wm.y_create_path_curve_for_layer', text='Create Curve', icon='ADD' if is_bl_newer_than(2, 80) else 'ZOOMIN')
 
-    col.prop(layer, 'path_enable_shrinkwrap')
+    sw = col.row(align=True)
+    sw.prop(layer, 'path_enable_shrinkwrap', text='Shrinkwrap')
+    method_row = sw.row(align=True)
+    method_row.enabled = layer.path_enable_shrinkwrap
+    method_row.prop(layer, 'path_shrinkwrap_method', expand=True)
 
     col.separator()
     col.prop(layer, 'path_resolution')
