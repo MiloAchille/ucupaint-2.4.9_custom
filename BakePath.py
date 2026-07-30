@@ -104,21 +104,41 @@ def select_path_bake_layer_for_curve(curve_obj):
 _last_path_curve_layer_sync = None
 _pending_path_curve_layer_sync = None
 _pending_layer_to_curve_tree = None
+_pending_layer_to_curve_index = None
 _last_layer_to_curve_key = None
 _path_sel_sync_lock = False
+
+def clear_path_selection_sync_state():
+    '''Drop pending layer↔curve sync (call after deleting curves / layers).'''
+    global _pending_path_curve_layer_sync, _pending_layer_to_curve_tree
+    global _pending_layer_to_curve_index, _last_layer_to_curve_key, _last_path_curve_layer_sync
+    _pending_path_curve_layer_sync = None
+    _pending_layer_to_curve_tree = None
+    _pending_layer_to_curve_index = None
+    _last_layer_to_curve_key = None
+    _last_path_curve_layer_sync = None
 
 def _deferred_path_curve_layer_sync():
     '''Timer callback — RNA writes are unsafe directly from depsgraph/msgbus.'''
     global _pending_path_curve_layer_sync, _last_path_curve_layer_sync, _path_sel_sync_lock
     curve_obj = _pending_path_curve_layer_sync
     _pending_path_curve_layer_sync = None
-    if not curve_obj:
+    if not curve_obj or _path_sel_sync_lock:
+        return None
+    # A layer-list change is in flight — don't snap the layer back to an old curve
+    if _pending_layer_to_curve_tree is not None:
         return None
     # Object may have been deleted between schedule and run
     try:
         _ = curve_obj.name
     except ReferenceError:
         _last_path_curve_layer_sync = None
+        return None
+    # Stale: user already moved selection (e.g. layer list picked another layer)
+    try:
+        if bpy.context.object != curve_obj:
+            return None
+    except Exception:
         return None
     _path_sel_sync_lock = True
     try:
@@ -135,6 +155,9 @@ def sync_active_path_curve_layer_selection():
     '''
     global _last_path_curve_layer_sync, _pending_path_curve_layer_sync
     if _path_sel_sync_lock:
+        return
+    # Don't fight an in-progress layer→curve sync (layer list click wins)
+    if _pending_layer_to_curve_tree is not None:
         return
     try:
         obj = bpy.context.object
@@ -173,15 +196,21 @@ def _select_only_object(obj):
 
 def _deferred_layer_to_curve_sync():
     '''When a path/shape layer becomes active, select its curve (and vice versa leave).'''
-    global _pending_layer_to_curve_tree, _last_path_curve_layer_sync, _path_sel_sync_lock
+    global _pending_layer_to_curve_tree, _pending_layer_to_curve_index
+    global _last_path_curve_layer_sync, _path_sel_sync_lock
     tree = _pending_layer_to_curve_tree
+    want_idx = _pending_layer_to_curve_index
     _pending_layer_to_curve_tree = None
+    _pending_layer_to_curve_index = None
     if not tree or _path_sel_sync_lock:
         return None
     yp = getattr(tree, 'yp', None)
     if not yp or getattr(yp, 'halt_update', False):
         return None
     if len(yp.layers) == 0 or yp.active_layer_index < 0 or yp.active_layer_index >= len(yp.layers):
+        return None
+    # Another layer click already superseded this deferred job
+    if want_idx is not None and int(yp.active_layer_index) != int(want_idx):
         return None
 
     layer = yp.layers[yp.active_layer_index]
@@ -224,7 +253,8 @@ def _deferred_layer_to_curve_sync():
 
 def schedule_sync_active_layer_to_path_curve(yp):
     '''Defer layer→curve object selection (safe from active_layer_index update).'''
-    global _pending_layer_to_curve_tree, _last_layer_to_curve_key
+    global _pending_layer_to_curve_tree, _pending_layer_to_curve_index
+    global _last_layer_to_curve_key, _pending_path_curve_layer_sync
     if _path_sel_sync_lock or not yp:
         return
     if getattr(yp, 'halt_update', False):
@@ -239,7 +269,11 @@ def schedule_sync_active_layer_to_path_curve(yp):
     if key == _last_layer_to_curve_key:
         return
     _last_layer_to_curve_key = key
+    # Layer list click wins: cancel any stale curve→layer job still queued from
+    # the previously active path curve (that was the "snap back" bug).
+    _pending_path_curve_layer_sync = None
     _pending_layer_to_curve_tree = tree
+    _pending_layer_to_curve_index = int(yp.active_layer_index)
     if not bpy.app.timers.is_registered(_deferred_layer_to_curve_sync):
         bpy.app.timers.register(_deferred_layer_to_curve_sync, first_interval=0.0)
 
@@ -263,8 +297,8 @@ def remove_path_curve_object(layer):
         return
 
     # Keep the curve if another path/shape layer still references it
-    parent = curve_obj.parent
-    if parent and parent.type == 'MESH':
+    parent = curve_obj.parent if curve_obj.parent and curve_obj.parent.type == 'MESH' else None
+    if parent:
         for slot in parent.material_slots:
             mat = slot.material
             if not mat or not mat.node_tree:
@@ -278,6 +312,25 @@ def remove_path_curve_object(layer):
                 for other in yp.layers:
                     if get_path_curve_object(other) == curve_obj:
                         return
+
+    # Layer↔curve sync often makes the curve the active object — switch to the
+    # parent mesh before deleting so context.object is not a removed StructRNA.
+    try:
+        active = bpy.context.object
+    except Exception:
+        active = None
+    if parent and active == curve_obj:
+        global _last_path_curve_layer_sync, _path_sel_sync_lock
+        _path_sel_sync_lock = True
+        try:
+            set_object_select(curve_obj, False)
+            set_object_select(parent, True)
+            set_active_object(parent)
+            clear_path_selection_sync_state()
+        finally:
+            _path_sel_sync_lock = False
+    else:
+        clear_path_selection_sync_state()
 
     curve_data = curve_obj.data
     remove_datablock(bpy.data.objects, curve_obj)
@@ -530,6 +583,37 @@ def _curve_has_enabled_shrinkwrap(curve_obj):
     mod = get_path_shrinkwrap_modifier(curve_obj)
     return bool(mod and mod.show_viewport and mod.target)
 
+def _curve_shrinkwrap_method(curve_obj, fallback=None):
+    '''Return active shrinkwrap wrap_method, or fallback / None if disabled.'''
+    if not _curve_has_enabled_shrinkwrap(curve_obj):
+        return fallback
+    mod = get_path_shrinkwrap_modifier(curve_obj)
+    if not mod:
+        return fallback
+    return getattr(mod, 'wrap_method', 'NEAREST_SURFACEPOINT') or 'NEAREST_SURFACEPOINT'
+
+def _curve_to_polyline(curve_obj, resolution=64, shrinkwrap_method=None):
+    '''Return world-space polyline points sampled from a CURVE object.'''
+    method = shrinkwrap_method if shrinkwrap_method is not None else _curve_shrinkwrap_method(curve_obj)
+
+    # Project (or no shrinkwrap): keep authored silhouette — do not nearest-snap
+    if method == 'PROJECT' or method is None or not _curve_has_enabled_shrinkwrap(curve_obj):
+        points = _sample_bezier_math(curve_obj, resolution)
+        if len(points) >= 2:
+            return points
+        return _sample_evaluated_curve(curve_obj, resolution)
+
+    # Nearest: sample evaluated / snap to closest surface
+    if _curve_has_enabled_shrinkwrap(curve_obj):
+        points = _sample_evaluated_curve(curve_obj, resolution)
+        if len(points) >= 2:
+            return points
+
+    points = _sample_bezier_math(curve_obj, resolution)
+    if len(points) >= 2:
+        return points
+    return _sample_evaluated_curve(curve_obj, resolution)
+
 def _sample_evaluated_curve(curve_obj, resolution):
     '''Sample curve after modifiers (e.g. Shrinkwrap) via evaluated mesh conversion.'''
     depsgraph = bpy.context.evaluated_depsgraph_get()
@@ -564,8 +648,7 @@ def _sample_evaluated_curve(curve_obj, resolution):
         return points
 
     wrap_method = getattr(mod, 'wrap_method', 'NEAREST_SURFACEPOINT')
-    # Project with no axes does not move points in Blender — keep authored silhouette.
-    # Nearest snaps each sample to the closest surface point.
+    # Project: keep authored silhouette. Nearest: snap to closest surface point.
     if wrap_method == 'PROJECT':
         return points
 
@@ -603,71 +686,128 @@ def _curve_is_cyclic(curve_obj):
         return False
     return any(getattr(s, 'use_cyclic_u', False) for s in curve_obj.data.splines)
 
-def _curve_to_polyline(curve_obj, resolution=64):
-    '''Return world-space polyline points sampled from a CURVE object.'''
-    # When Shrinkwrap is on, sample evaluated / projected geometry so baking follows the surface
-    if _curve_has_enabled_shrinkwrap(curve_obj):
-        points = _sample_evaluated_curve(curve_obj, resolution)
-        if len(points) >= 2:
-            return points
-
-    # Prefer mathematical bezier sampling (reliable even without bevel/extrude)
-    points = _sample_bezier_math(curve_obj, resolution)
-    if len(points) >= 2:
-        return points
-
-    # Fallback: convert evaluated curve to mesh (works for poly / modifiers)
-    return _sample_evaluated_curve(curve_obj, resolution)
-
 def _sample_bezier_math(curve_obj, resolution):
-    '''Fallback bezier sampling without mesh conversion.'''
+    '''Fallback bezier sampling without mesh conversion (all splines concatenated).'''
+    loops = _sample_bezier_math_loops(curve_obj, resolution)
+    if not loops:
+        return []
+    if len(loops) == 1:
+        return loops[0]
+    # Ribbon/legacy callers expect one polyline — join with gaps (not ideal for shapes)
+    out = []
+    for loop in loops:
+        if out and (out[-1] - loop[0]).length > 1e-6:
+            out.append(loop[0].copy())
+        out.extend(loop)
+    return out
+
+def _sample_bezier_math_loops(curve_obj, resolution):
+    '''
+    Sample each spline as its own world-space polyline.
+    Multi-cyclic shapes stay separate so fill does not bridge between loops.
+    '''
     mw = curve_obj.matrix_world
-    points = []
+    loops = []
     curve = curve_obj.data
-    any_cyclic = False
+    res_each = max(16, int(resolution))
 
     for spline in curve.splines:
+        points = []
+        cyclic = bool(getattr(spline, 'use_cyclic_u', False))
+
         if spline.type != 'BEZIER':
-            # Poly / NURBS: use control points as coarse polyline
             pts = [mw @ Vector(p.co[:3]) for p in spline.points]
-            points.extend(pts)
-            if getattr(spline, 'use_cyclic_u', False) and len(pts) >= 2:
-                any_cyclic = True
-                # Include closing segment so resample covers the full loop
-                points.append(pts[0].copy())
-            continue
+            if len(pts) < (3 if cyclic else 2):
+                continue
+            if cyclic and (pts[0] - pts[-1]).length > 1e-6:
+                pts = list(pts) + [pts[0].copy()]
+            points = _resample_polyline(pts, res_each)
+        else:
+            bps = spline.bezier_points
+            if len(bps) < 2:
+                continue
+            segs = len(bps) if cyclic else (len(bps) - 1)
+            if segs < 1:
+                continue
+            samples_per_seg = max(2, res_each // max(segs, 1))
+            for i in range(segs):
+                p0 = bps[i]
+                p1 = bps[(i + 1) % len(bps)]
+                knot0 = mw @ p0.co
+                handle0 = mw @ p0.handle_right
+                handle1 = mw @ p1.handle_left
+                knot1 = mw @ p1.co
+                for j in range(samples_per_seg):
+                    if i > 0 and j == 0:
+                        continue
+                    t = j / float(samples_per_seg - 1) if samples_per_seg > 1 else 0.0
+                    points.append(_bezier_point(knot0, handle0, handle1, knot1, t))
+            if len(points) < 2:
+                continue
+            if cyclic and (points[0] - points[-1]).length > 1e-6:
+                points.append(points[0].copy())
+            points = _resample_polyline(points, res_each)
 
-        bps = spline.bezier_points
-        if len(bps) < 2:
-            continue
+        if cyclic and len(points) >= 2 and (points[0] - points[-1]).length < 1e-4:
+            points = points[:-1]
+        if len(points) >= 3:
+            loops.append(points)
+        elif len(points) >= 2:
+            loops.append(points)
+    return loops
 
-        segs = len(bps) - 1
-        if spline.use_cyclic_u:
-            segs = len(bps)
-            any_cyclic = True
+def _snap_polyline_nearest_to_target(points, target_obj, offset=0.0):
+    '''Snap polyline points to nearest surface on target mesh (world space).'''
+    if not points or not target_obj or target_obj.type != 'MESH':
+        return points
+    try:
+        import bmesh as _bmesh
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        bm = _bmesh.new()
+        eval_target = target_obj.evaluated_get(depsgraph)
+        try:
+            bm.from_object(eval_target, depsgraph)
+        except TypeError:
+            bm.from_mesh(target_obj.data)
+        bm.transform(target_obj.matrix_world)
+        bvh = BVHTree.FromBMesh(bm)
+        projected = []
+        for p in points:
+            hit = bvh.find_nearest(p)
+            if hit and hit[0] is not None:
+                loc, normal, _, _ = hit
+                if offset and normal is not None:
+                    n = Vector(normal)
+                    if n.length > 1e-8:
+                        n.normalize()
+                        loc = loc + n * offset
+                projected.append(Vector(loc))
+            else:
+                projected.append(p)
+        bm.free()
+        return projected
+    except Exception:
+        return points
 
-        samples_per_seg = max(2, resolution // max(segs, 1))
-
-        for i in range(segs):
-            p0 = bps[i]
-            p1 = bps[(i + 1) % len(bps)]
-            knot0 = mw @ p0.co
-            handle0 = mw @ p0.handle_right
-            handle1 = mw @ p1.handle_left
-            knot1 = mw @ p1.co
-            for j in range(samples_per_seg):
-                if i > 0 and j == 0:
-                    continue
-                t = j / float(samples_per_seg - 1) if samples_per_seg > 1 else 0.0
-                points.append(_bezier_point(knot0, handle0, handle1, knot1, t))
-
-    if len(points) < 2:
+def _curve_to_polylines(curve_obj, resolution=64, shrinkwrap_method=None):
+    '''
+    Return a list of world-space polylines, one per spline.
+    Nearest: snap each loop to the surface. Project: keep authored silhouette.
+    '''
+    loops = _sample_bezier_math_loops(curve_obj, resolution)
+    if not loops:
         return []
-    points = _resample_polyline(points, resolution)
-    # Cyclic ribbons bake as an open ring of unique samples; the close is bridged later
-    if any_cyclic and len(points) >= 2 and (points[0] - points[-1]).length < 1e-4:
-        points = points[:-1]
-    return points
+    method = shrinkwrap_method if shrinkwrap_method is not None else _curve_shrinkwrap_method(curve_obj)
+    if method == 'PROJECT' or method is None or not _curve_has_enabled_shrinkwrap(curve_obj):
+        return loops
+    mod = get_path_shrinkwrap_modifier(curve_obj)
+    if not mod or not mod.target:
+        return loops
+    offset = float(mod.offset) if mod else 0.0
+    return [
+        _snap_polyline_nearest_to_target(loop, mod.target, offset=offset)
+        for loop in loops
+    ]
 
 def _bezier_point(p0, p1, p2, p3, t):
     u = 1.0 - t
@@ -890,6 +1030,43 @@ def _sample_path_texture(tex_pxs, tw, th, u_len, v_across, tile_u=1.0, rotation_
     c1 = c01 * (1 - fx) + c11 * fx
     return c0 * (1 - fy) + c1 * fy
 
+def _sample_path_texture_batch(tex_pxs, tw, th, u_len, v_across, tile_u=1.0, rotation_deg=0.0):
+    '''Vectorized bilinear texture sample. u_len/v_across are 1D float arrays.'''
+    uu = numpy.mod(u_len * float(tile_u), 1.0)
+    uu = numpy.where(uu < 0.0, uu + 1.0, uu)
+    vv = v_across * 0.5 + 0.5
+
+    if rotation_deg:
+        rad = math.radians(rotation_deg)
+        cos_a = math.cos(rad)
+        sin_a = math.sin(rad)
+        x = uu - 0.5
+        y = vv - 0.5
+        uu = x * cos_a - y * sin_a + 0.5
+        vv = x * sin_a + y * cos_a + 0.5
+        uu = numpy.mod(uu, 1.0)
+        vv = numpy.mod(vv, 1.0)
+        uu = numpy.where(uu < 0.0, uu + 1.0, uu)
+        vv = numpy.where(vv < 0.0, vv + 1.0, vv)
+    else:
+        vv = numpy.clip(vv, 0.0, 1.0)
+
+    x = uu * float(tw - 1)
+    y = vv * float(th - 1)
+    x0 = numpy.floor(x).astype(numpy.int32)
+    y0 = numpy.floor(y).astype(numpy.int32)
+    x1 = numpy.minimum(x0 + 1, tw - 1)
+    y1 = numpy.minimum(y0 + 1, th - 1)
+    fx = (x - x0).astype(numpy.float32)[:, None]
+    fy = (y - y0).astype(numpy.float32)[:, None]
+    c00 = tex_pxs[y0, x0]
+    c10 = tex_pxs[y0, x1]
+    c01 = tex_pxs[y1, x0]
+    c11 = tex_pxs[y1, x1]
+    c0 = c00 * (1.0 - fx) + c10 * fx
+    c1 = c01 * (1.0 - fx) + c11 * fx
+    return c0 * (1.0 - fy) + c1 * fy
+
 def _uv_pixel_dist(uv_a, uv_b, img_w, img_h):
     dx = (uv_a.x - uv_b.x) * (img_w - 1)
     dy = (uv_a.y - uv_b.y) * (img_h - 1)
@@ -947,17 +1124,25 @@ def _fit_polyline_plane(polyline):
         axis_v.normalize()
     return center, axis_u, axis_v, normal
 
-def _project_shape_polyline_to_uv(polyline, bvh, tris, project_distance):
+def _project_shape_polyline_to_uv(polyline, bvh, tris, project_distance,
+                                  preserve_silhouette=False):
     '''
     Map a closed world-space shape into UV continuously.
 
-    Default: nearest-surface UVs (accurate placement under the curve).
-    Only when a clear overhang is present: keep nearest UVs on-mesh and
-    extrapolate off-mesh points with a plane->UV affine fit so the fill can
-    extend into empty texture padding past island edges.
+    preserve_silhouette=False (Nearest / hybrid):
+      On-mesh points keep nearest UVs; clear overhangs use plane->UV affine.
+    preserve_silhouette=True (Project):
+      Always map the full authored outline through plane->UV affine so the bake
+      matches the Project curve instead of collapsing like Nearest.
     '''
     if len(polyline) < 3:
         return [], 0
+
+    center, axis_u, axis_v, _normal = _fit_polyline_plane(polyline)
+
+    def to_plane(p):
+        d = p - center
+        return (d.dot(axis_u), d.dot(axis_v))
 
     # Per-point hits (None if no hit within project_distance)
     point_hits = []  # list of (uv, dist) or None
@@ -983,9 +1168,6 @@ def _project_shape_polyline_to_uv(polyline, bvh, tris, project_distance):
 
     sorted_d = sorted(hit_dists)
     median = sorted_d[len(sorted_d) // 2]
-    # Strict: only points much farther than the typical on-surface distance
-    # count as overhang. Loose thresholds previously mis-tagged curved on-mesh
-    # points and mixed affine UVs into an otherwise good outline.
     on_thresh = max(median * 6.0, sorted_d[0] * 12.0, 1e-5)
     if project_distance is not None:
         on_thresh = min(on_thresh, max(project_distance * 0.35, median * 3.0 + 1e-6))
@@ -995,8 +1177,8 @@ def _project_shape_polyline_to_uv(polyline, bvh, tris, project_distance):
         if ph is None or ph[1] > on_thresh:
             overhang_indices.add(i)
 
-    # No clear overhang → pure nearest (stable placement; identical to old path)
-    if len(overhang_indices) < 3:
+    # Hybrid only: no clear overhang → pure nearest
+    if not preserve_silhouette and len(overhang_indices) < 3:
         uvs = []
         for ph in point_hits:
             if ph is not None:
@@ -1005,28 +1187,30 @@ def _project_shape_polyline_to_uv(polyline, bvh, tris, project_distance):
             return _project_polyline_to_uv(polyline, bvh, tris, project_distance)
         return uvs, seam_jumps
 
-    center, axis_u, axis_v, _normal = _fit_polyline_plane(polyline)
-
-    def to_plane(p):
-        d = p - center
-        return (d.dot(axis_u), d.dot(axis_v))
-
+    # Train affine from on-surface samples (closest hits for Project / overhang)
     samples_st = []
     samples_uv = []
     for _i, p, uv, dist in hits:
-        if dist > on_thresh:
+        if not preserve_silhouette and dist > on_thresh:
             continue
-        s, t = to_plane(p)
-        samples_st.append((s, t))
+        # For Project silhouette: prefer closer hits as trainers, still allow all
+        samples_st.append(to_plane(p))
         samples_uv.append((uv.x, uv.y))
 
-    if len(samples_st) < 3:
+    if preserve_silhouette:
+        # Prefer the closest third of hits so edge-collapsed far points don't bias the fit
+        closest = sorted(hits, key=lambda h: h[3])[:max(3, max(3, len(hits) // 2))]
+        samples_st = []
+        samples_uv = []
+        for _i, p, uv, _dist in closest:
+            samples_st.append(to_plane(p))
+            samples_uv.append((uv.x, uv.y))
+    elif len(samples_st) < 3:
         closest = sorted(hits, key=lambda h: h[3])[:max(3, len(hits) // 3)]
         samples_st = []
         samples_uv = []
         for _i, p, uv, _dist in closest:
-            s, t = to_plane(p)
-            samples_st.append((s, t))
+            samples_st.append(to_plane(p))
             samples_uv.append((uv.x, uv.y))
 
     xu = xv = None
@@ -1041,19 +1225,34 @@ def _project_shape_polyline_to_uv(polyline, bvh, tris, project_distance):
             pred_u = A @ xu
             pred_v = A @ xv
             err = float(numpy.sqrt(numpy.mean((pred_u - bu) ** 2 + (pred_v - bv) ** 2)))
-            # High residual / seam jumps → skip affine (avoid smear across islands)
-            affine_ok = err <= 0.08 and seam_jumps < 3
+            if preserve_silhouette:
+                # Project must keep silhouette even across mild unwrap distortion
+                affine_ok = err <= 0.20
+            else:
+                affine_ok = err <= 0.08 and seam_jumps < 3
         except Exception:
             affine_ok = False
 
     if not affine_ok:
-        uvs = []
-        for ph in point_hits:
-            if ph is not None:
-                uvs.append(ph[0].copy())
-        if len(uvs) < 3:
-            return _project_polyline_to_uv(polyline, bvh, tris, project_distance)
-        return uvs, seam_jumps
+        if preserve_silhouette:
+            # Last resort for Project: still try affine from all hits (ignore residual)
+            try:
+                A = numpy.array([[to_plane(p)[0], to_plane(p)[1], 1.0] for _i, p, _uv, _d in hits], dtype=numpy.float64)
+                bu = numpy.array([uv.x for _i, _p, uv, _d in hits], dtype=numpy.float64)
+                bv = numpy.array([uv.y for _i, _p, uv, _d in hits], dtype=numpy.float64)
+                xu, _, _, _ = numpy.linalg.lstsq(A, bu, rcond=None)
+                xv, _, _, _ = numpy.linalg.lstsq(A, bv, rcond=None)
+                affine_ok = True
+            except Exception:
+                affine_ok = False
+        if not affine_ok:
+            uvs = []
+            for ph in point_hits:
+                if ph is not None:
+                    uvs.append(ph[0].copy())
+            if len(uvs) < 3:
+                return _project_polyline_to_uv(polyline, bvh, tris, project_distance)
+            return uvs, seam_jumps
 
     def affine_uv(p):
         s, t = to_plane(p)
@@ -1061,6 +1260,10 @@ def _project_shape_polyline_to_uv(polyline, bvh, tris, project_distance):
             float(xu[0] * s + xu[1] * t + xu[2]),
             float(xv[0] * s + xv[1] * t + xv[2]),
         ))
+
+    # Project: every outline point through affine (preserves authored silhouette)
+    if preserve_silhouette:
+        return [affine_uv(p) for p in polyline], seam_jumps
 
     # Hybrid: nearest on-mesh, affine only for clear overhang / missed points
     uvs = []
@@ -1203,10 +1406,13 @@ def _box_blur_mask(mask, radius):
 def bake_shape_to_image(obj, image, curve_obj, uv_name, resolution,
                         color=(1, 1, 1, 1), falloff=1.0, clear=True,
                         path_texture=None, tile_u=1.0, rotation_deg=0.0,
-                        feather_px=2.0, project_distance=None):
+                        feather_px=2.0, project_distance=None,
+                        shrinkwrap_method=None):
     '''
     Project a closed (cyclic) curve to UV and fill it as a solid vector shape.
     Returns (ok, message).
+
+    shrinkwrap_method: 'NEAREST_SURFACEPOINT' | 'PROJECT' | None (read from modifier)
     '''
     if not obj or obj.type != 'MESH':
         return False, 'Active object must be a mesh'
@@ -1226,13 +1432,13 @@ def bake_shape_to_image(obj, image, curve_obj, uv_name, resolution,
     if img_w < 1 or img_h < 1:
         return False, 'Invalid image size'
 
-    # Use path resolution for shapes too (was hard-capped at 96 → soft/short edges)
     shape_res = min(max(int(resolution), 32), 1024)
-
-    # Authored silhouette preserves overhang past the mesh. Evaluated / shrinkwrap
-    # silhouette matches the viewport for shapes that sit fully on the surface.
-    authored = _sample_bezier_math(curve_obj, shape_res)
-    evaluated = _curve_to_polyline(curve_obj, resolution=shape_res)
+    method = shrinkwrap_method if shrinkwrap_method is not None else _curve_shrinkwrap_method(
+        curve_obj, fallback='NEAREST_SURFACEPOINT'
+    )
+    if isinstance(method, str):
+        method = method.upper()
+    use_project = (method == 'PROJECT')
 
     if project_distance is None:
         dim = max(obj.dimensions) if obj.dimensions.length > 0 else 1.0
@@ -1266,62 +1472,91 @@ def bake_shape_to_image(obj, image, curve_obj, uv_name, resolution,
         n_far = sum(1 for d in dists if d > thresh)
         return n_far + misses
 
-    authored = _close_loop(authored) if len(authored) >= 3 else []
-    evaluated = _close_loop(evaluated) if len(evaluated) >= 3 else []
-
-    use_overhang = len(authored) >= 3 and _count_overhang(authored) >= 3
-    if use_overhang:
-        polyline = authored
-        uvs, seam_jumps = _project_shape_polyline_to_uv(polyline, bvh, tris, project_distance)
+    # Authored loops always; Nearest also builds surface-snapped loops
+    authored_loops = [_close_loop(L) for L in _sample_bezier_math_loops(curve_obj, shape_res) if len(L) >= 3]
+    if use_project:
+        # Project: bake the authored silhouette (matches Project viewport intent)
+        source_loops = authored_loops
     else:
-        # Stable path: bake the shrinkwrapped / evaluated shape with nearest UVs only
-        polyline = evaluated if len(evaluated) >= 3 else authored
-        if len(polyline) < 3:
-            return False, 'Closed shape needs at least 3 projected points'
-        uvs, seam_jumps = _project_polyline_to_uv(polyline, bvh, tris, project_distance)
+        source_loops = [
+            _close_loop(L) for L in _curve_to_polylines(
+                curve_obj, resolution=shape_res, shrinkwrap_method='NEAREST_SURFACEPOINT'
+            ) if len(L) >= 3
+        ]
+        if not source_loops:
+            source_loops = authored_loops
 
-    if len(uvs) < 3:
-        return False, 'Could not project the shape onto the mesh UVs'
-
-    # Drop closing duplicate if present
-    if (uvs[0] - uvs[-1]).length < 1e-6:
-        uvs = uvs[:-1]
-    if len(uvs) < 3:
-        return False, 'Shape UV polygon is degenerate'
-
-    # Pixel-space polygon. Use uv * size so texel centers match Blender sampling
-    # (uv*(size-1) slightly shrinks shapes toward the UV origin).
-    poly = [(uv.x * img_w, uv.y * img_h) for uv in uvs]
-    max_poly = min(max(shape_res, 64), 1024)
-    poly = _decimate_poly(poly, max_points=max_poly)
-    poly = _densify_poly_edges(poly, max_edge_px=1.5)
+    if not source_loops:
+        return False, 'Closed shape needs at least 3 projected points'
 
     feather = max(0.0, float(feather_px))
-    # Hard fills: nudge outline out by half a pixel so mesh-edge windows don't
-    # leave a white fringe from subpixel underfill / inset shrinkwrap.
-    if feather <= 0.5:
-        poly = _inflate_poly(poly, 0.6)
+    max_poly = min(max(shape_res, 64), 1024)
+    mask = numpy.zeros((img_h, img_w), dtype=numpy.float32)
+    seam_jumps = 0
+    all_uvs = []
+    all_xs = []
+    all_ys = []
+    loops_baked = 0
 
-    xs = [p[0] for p in poly]
-    ys = [p[1] for p in poly]
-    pad = int(math.ceil(max(feather, 0.6))) + 2
-    min_x = max(0, int(math.floor(min(xs) - pad)))
-    max_x = min(img_w - 1, int(math.ceil(max(xs) + pad)))
-    min_y = max(0, int(math.floor(min(ys) - pad)))
-    max_y = min(img_h - 1, int(math.ceil(max(ys) + pad)))
+    for li, polyline in enumerate(source_loops):
+        authored = authored_loops[li] if li < len(authored_loops) else polyline
+        if use_project:
+            # Full plane->UV affine — do not nearest-collapse (that looked like Nearest bake)
+            uvs, jumps = _project_shape_polyline_to_uv(
+                authored, bvh, tris, project_distance, preserve_silhouette=True
+            )
+        else:
+            use_overhang = len(authored) >= 3 and _count_overhang(authored) >= 3
+            if use_overhang:
+                uvs, jumps = _project_shape_polyline_to_uv(
+                    authored, bvh, tris, project_distance, preserve_silhouette=False
+                )
+            else:
+                uvs, jumps = _project_polyline_to_uv(polyline, bvh, tris, project_distance)
+        seam_jumps += jumps
+        if len(uvs) < 3:
+            continue
+        if (uvs[0] - uvs[-1]).length < 1e-6:
+            uvs = uvs[:-1]
+        if len(uvs) < 3:
+            continue
 
-    # Fast scanline mask, optional soft edge via blur (not per-pixel edge distance)
-    mask = _scanline_fill_mask(poly, img_w, img_h, min_x, max_x, min_y, max_y)
-    if feather > 0.5:
-        # Blur a cropped region for speed, then write back
-        crop = mask[min_y:max_y + 1, min_x:max_x + 1]
-        crop = _box_blur_mask(crop, feather)
-        # Falloff curve on alpha (0 = hard threshold after blur)
-        if falloff <= 0.0:
-            crop = (crop >= 0.5).astype(numpy.float32)
-        elif falloff != 1.0:
-            crop = numpy.power(numpy.clip(crop, 0.0, 1.0), float(falloff)).astype(numpy.float32)
-        mask[min_y:max_y + 1, min_x:max_x + 1] = crop
+        poly = [(uv.x * img_w, uv.y * img_h) for uv in uvs]
+        poly = _decimate_poly(poly, max_points=max_poly)
+        poly = _densify_poly_edges(poly, max_edge_px=1.5)
+        if feather <= 0.5:
+            poly = _inflate_poly(poly, 0.6)
+
+        xs = [p[0] for p in poly]
+        ys = [p[1] for p in poly]
+        pad = int(math.ceil(max(feather, 0.6))) + 2
+        min_x = max(0, int(math.floor(min(xs) - pad)))
+        max_x = min(img_w - 1, int(math.ceil(max(xs) + pad)))
+        min_y = max(0, int(math.floor(min(ys) - pad)))
+        max_y = min(img_h - 1, int(math.ceil(max(ys) + pad)))
+
+        loop_mask = _scanline_fill_mask(poly, img_w, img_h, min_x, max_x, min_y, max_y)
+        if feather > 0.5:
+            crop = loop_mask[min_y:max_y + 1, min_x:max_x + 1]
+            crop = _box_blur_mask(crop, feather)
+            if falloff <= 0.0:
+                crop = (crop >= 0.5).astype(numpy.float32)
+            elif falloff != 1.0:
+                crop = numpy.power(numpy.clip(crop, 0.0, 1.0), float(falloff)).astype(numpy.float32)
+            loop_mask[min_y:max_y + 1, min_x:max_x + 1] = crop
+
+        numpy.maximum(mask, loop_mask, out=mask)
+        all_uvs.extend(uvs)
+        all_xs.extend(xs)
+        all_ys.extend(ys)
+        loops_baked += 1
+
+    if loops_baked == 0 or not all_xs:
+        return False, 'Could not project the shape onto the mesh UVs'
+
+    uvs = all_uvs
+    xs = all_xs
+    ys = all_ys
 
     if is_bl_newer_than(2, 83):
         pxs = numpy.empty(shape=img_w * img_h * 4, dtype=numpy.float32)
@@ -1363,26 +1598,28 @@ def bake_shape_to_image(obj, image, curve_obj, uv_name, resolution,
                 pxs[:, :, ch][m] = (cval * src_a + dst_c * dst_a * (1.0 - src_a)) / safe
             pxs[:, :, 3][m] = numpy.minimum(out_a, 1.0)
     else:
-        # Textured fill — only evaluate texels where mask is visible
+        # Textured fill — vectorized bilinear sample + blend (was a slow Python loop)
         bbox_w = max(max(xs) - min(xs), 1e-6)
         bbox_h = max(max(ys) - min(ys), 1e-6)
-        ys_idx, xs_idx = numpy.nonzero(alpha > 1e-4)
-        for yi, xi in zip(ys_idx.tolist(), xs_idx.tolist()):
-            cx = xi + 0.5
-            cy = yi + 0.5
-            u_local = (cx - min(xs)) / bbox_w
-            v_local = (cy - min(ys)) / bbox_h
-            rgba = _sample_path_texture(
+        m = alpha > 1e-4
+        ys_idx, xs_idx = numpy.nonzero(m)
+        if len(xs_idx):
+            u_local = (xs_idx.astype(numpy.float32) + 0.5 - min(xs)) / bbox_w
+            v_local = (ys_idx.astype(numpy.float32) + 0.5 - min(ys)) / bbox_h
+            sampled = _sample_path_texture_batch(
                 tex_pxs, tw, th, u_local, v_local * 2.0 - 1.0,
                 tile_u=tile_u, rotation_deg=rotation_deg
             )
-            rgba = (
-                float(rgba[0]) * cr,
-                float(rgba[1]) * cg,
-                float(rgba[2]) * cb,
-                float(rgba[3]) * ca,
-            )
-            _blend_pixel(pxs, int(xi), int(yi), rgba, float(alpha[yi, xi]) / max(ca, 1e-8))
+            # Matches previous per-pixel path: strength = mask, src_a = tex_a * alpha
+            src_a = sampled[:, 3] * alpha[ys_idx, xs_idx]
+            dst_a = pxs[ys_idx, xs_idx, 3]
+            out_a = src_a + dst_a * (1.0 - src_a)
+            safe = numpy.maximum(out_a, 1e-8)
+            for ch, cval in enumerate((cr, cg, cb)):
+                src_c = sampled[:, ch] * cval
+                dst_c = pxs[ys_idx, xs_idx, ch]
+                pxs[ys_idx, xs_idx, ch] = (src_c * src_a + dst_c * dst_a * (1.0 - src_a)) / safe
+            pxs[ys_idx, xs_idx, 3] = numpy.minimum(out_a, 1.0)
 
     flat = pxs.ravel()
     if is_bl_newer_than(2, 83):
@@ -1392,7 +1629,10 @@ def bake_shape_to_image(obj, image, curve_obj, uv_name, resolution,
     image.update()
 
     total = img_w * img_h
-    msg = 'Filled shape (%d / %d pixels)' % (filled, total)
+    msg = 'Filled shape (%d loop%s, %d / %d pixels)' % (
+        loops_baked, 's' if loops_baked != 1 else '', filled, total
+    )
+    msg += ' [%s]' % ('Project' if use_project else 'Nearest')
     uv_xs = [uv.x for uv in uvs]
     uv_ys = [uv.y for uv in uvs]
     if min(uv_xs) < -0.01 or max(uv_xs) > 1.01 or min(uv_ys) < -0.01 or max(uv_ys) > 1.01:
@@ -1405,7 +1645,7 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
                        color=(1, 1, 1, 1), falloff=1.0, clear=True,
                        path_texture=None, tile_u=1.0, rotation_deg=0.0,
                        project_distance=None, fill_gaps=True, mode='RIBBON',
-                       feather_px=2.0):
+                       feather_px=2.0, shrinkwrap_method=None):
     '''
     Stamp a ribbon or filled closed shape from a real 3D curve onto a UV image.
     Returns (ok, message).
@@ -1415,7 +1655,8 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
             obj, image, curve_obj, uv_name, resolution,
             color=color, falloff=falloff, clear=clear,
             path_texture=path_texture, tile_u=tile_u, rotation_deg=rotation_deg,
-            feather_px=feather_px, project_distance=project_distance
+            feather_px=feather_px, project_distance=project_distance,
+            shrinkwrap_method=shrinkwrap_method
         )
 
     if not obj or obj.type != 'MESH':
@@ -1433,7 +1674,12 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
     if img_w < 1 or img_h < 1:
         return False, 'Invalid image size'
 
-    polyline = _curve_to_polyline(curve_obj, resolution=max(resolution, 8))
+    method = shrinkwrap_method if shrinkwrap_method is not None else _curve_shrinkwrap_method(
+        curve_obj, fallback='NEAREST_SURFACEPOINT'
+    )
+    polyline = _curve_to_polyline(
+        curve_obj, resolution=max(resolution, 8), shrinkwrap_method=method
+    )
     if len(polyline) < 2:
         return False, 'Curve has too few points to bake'
     width_samples = max(width_samples, 2)
@@ -1880,7 +2126,8 @@ class YNewPathLayer(bpy.types.Operator):
             falloff=layer.path_falloff,
             clear=True,
             mode=layer.path_mode,
-            feather_px=layer.path_shape_feather
+            feather_px=layer.path_shape_feather,
+            shrinkwrap_method=_layer_shrinkwrap_method(layer)
         )
         kind = 'Shape' if is_shape else 'Path'
         if not ok:
@@ -1953,6 +2200,10 @@ def bake_layer_path(obj, layer):
     if is_bl_newer_than(2, 79):
         path_tex = getattr(layer, 'path_texture', None)
 
+    method = _layer_shrinkwrap_method(layer)
+    if getattr(layer, 'path_enable_shrinkwrap', True):
+        ensure_path_shrinkwrap(curve_obj, obj, method=method)
+
     ok, msg = bake_path_to_image(
         obj, image, curve_obj, layer.uv_name,
         width=layer.path_width,
@@ -1966,6 +2217,7 @@ def bake_layer_path(obj, layer):
         rotation_deg=layer.path_texture_rotation,
         mode=layer.path_mode,
         feather_px=layer.path_shape_feather,
+        shrinkwrap_method=method,
     )
     if ok:
         image.update()

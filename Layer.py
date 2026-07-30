@@ -4319,18 +4319,25 @@ class YMoveInOutLayerGroupMenu(bpy.types.Operator):
 
 def remove_layer(yp, index, remove_on_disk=False):
     group_tree = yp.id_data
-    obj = bpy.context.object
+    from . import BakePath
+    obj = BakePath.resolve_path_bake_mesh(bpy.context.object)
+    if not obj:
+        obj = get_ypaint_ui_object(bpy.context.object) or bpy.context.object
     layer = yp.layers[index]
     layer_tree = get_tree(layer)
-    mat = obj.active_material
+    mat = get_active_material() if not obj else (obj.active_material if getattr(obj, 'type', None) == 'MESH' else get_active_material())
     wm = bpy.context.window_manager
 
     # Dealing with decal object
     Decal.remove_decal_object(layer_tree, layer)
 
-    # Dealing with path / shape bake curve
+    # Dealing with path / shape bake curve (may change active object to parent mesh)
     if getattr(layer, 'enable_path_bake', False):
         BakePath.remove_path_curve_object(layer)
+        # Refresh mesh pointer if the previous active object was the deleted curve
+        live = BakePath.resolve_path_bake_mesh(bpy.context.object)
+        if live:
+            obj = live
 
     # Dealing with image atlas segments
     if layer.type == 'IMAGE': # and layer.segment_name != '':
@@ -4532,7 +4539,19 @@ class YRemoveLayer(bpy.types.Operator):
     def execute(self, context):
         T = time.time()
 
-        obj = context.object
+        from . import BakePath
+
+        # Path/shape layers often have their curve as the active object — resolve
+        # the parent mesh up front so later UV cleanup still has a valid Object.
+        obj = BakePath.resolve_path_bake_mesh(context.object)
+        if not obj:
+            obj = get_ypaint_ui_object(context.object)
+        if not obj:
+            obj = context.object
+        if not obj:
+            self.report({'ERROR'}, 'No active object')
+            return {'CANCELLED'}
+
         wm = context.window_manager
         node = get_active_ypaint_node()
         group_tree = node.node_tree
@@ -4566,11 +4585,21 @@ class YRemoveLayer(bpy.types.Operator):
             # Remove layer
             remove_layer(yp, layer_idx, remove_on_disk=self.remove_on_disk)
 
+        # Prefer a live mesh reference (curve may have been deleted with the layer)
+        mesh = BakePath.resolve_path_bake_mesh(context.object)
+        if not mesh:
+            try:
+                _ = obj.name
+                mesh = obj if getattr(obj, 'type', None) == 'MESH' else None
+            except ReferenceError:
+                mesh = None
+
         # Remove temp uv layer
-        uv_layers = get_uv_layers(obj)
-        for uv in uv_layers:
-            if uv.name == TEMP_UV:
-                uv_layers.remove(uv)
+        if mesh:
+            uv_layers = get_uv_layers(mesh)
+            for uv in uv_layers:
+                if uv.name == TEMP_UV:
+                    uv_layers.remove(uv)
 
         # Set new active index
         if (yp.active_layer_index == len(yp.layers) and
