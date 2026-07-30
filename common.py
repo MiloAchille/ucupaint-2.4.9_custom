@@ -1002,12 +1002,35 @@ def get_active_material(obj=None):
 
     if not obj: return None
 
+    # Path/shape bake curves are children of the painted mesh — use the parent
+    # material so the UcuPaint N-panel stays available while editing the curve.
+    obj = get_ypaint_ui_object(obj)
+
     mat = obj.active_material
 
     if engine in {'BLENDER_RENDER', 'BLENDER_GAME'}:
         return None
 
     return mat
+
+def get_ypaint_ui_object(obj=None):
+    '''
+    Object used for UcuPaint UI / material lookup.
+    When a path/shape bake curve is selected, return its parent mesh.
+    '''
+    if obj is None:
+        if hasattr(bpy.context, 'object'):
+            obj = bpy.context.object
+        elif is_bl_newer_than(2, 80):
+            obj = bpy.context.view_layer.objects.active
+    if not obj:
+        return None
+    if obj.type == 'CURVE':
+        from . import BakePath
+        mesh = BakePath.get_mesh_for_path_curve(obj)
+        if mesh:
+            return mesh
+    return obj
 
 def get_list_of_ypaint_nodes(mat):
 

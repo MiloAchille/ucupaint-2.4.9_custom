@@ -23,6 +23,173 @@ def set_path_curve_object(layer, curve_obj):
         layer.path_curve_object = curve_obj
     layer.path_curve_object_name = curve_obj.name if curve_obj else ''
 
+def find_path_bake_layer_for_curve(curve_obj):
+    '''
+    Find the UcuPaint layer linked to this path/shape curve.
+    Returns (yp, layer_index) or (None, -1).
+    '''
+    if not curve_obj or curve_obj.type != 'CURVE':
+        return None, -1
+    parent = curve_obj.parent
+    if not parent or parent.type != 'MESH':
+        return None, -1
+
+    for slot in parent.material_slots:
+        mat = slot.material
+        if not mat or not mat.node_tree:
+            continue
+        for node in mat.node_tree.nodes:
+            if node.type != 'GROUP' or not node.node_tree:
+                continue
+            yp = getattr(node.node_tree, 'yp', None)
+            if not yp or not getattr(yp, 'is_ypaint_node', False):
+                continue
+            for i, layer in enumerate(yp.layers):
+                if not getattr(layer, 'enable_path_bake', False):
+                    continue
+                linked = get_path_curve_object(layer)
+                if linked == curve_obj:
+                    return yp, i
+                # Name fallback if the pointer was cleared / stale
+                if getattr(layer, 'path_curve_object_name', '') == curve_obj.name:
+                    return yp, i
+    return None, -1
+
+def get_mesh_for_path_curve(curve_obj):
+    '''
+    If curve_obj is a path/shape bake curve linked to a UcuPaint layer on its
+    parent mesh, return that mesh. Otherwise None.
+    '''
+    yp, _idx = find_path_bake_layer_for_curve(curve_obj)
+    if yp is None:
+        return None
+    return curve_obj.parent if curve_obj else None
+
+def select_path_bake_layer_for_curve(curve_obj):
+    '''Make the UcuPaint layer linked to this curve the active layer.'''
+    yp, idx = find_path_bake_layer_for_curve(curve_obj)
+    if yp is None or idx < 0 or idx >= len(yp.layers):
+        return False
+
+    from . import ListItem
+
+    # Classic list binds to active_layer_index
+    if yp.active_layer_index != idx:
+        yp.active_layer_index = idx
+
+    # Dynamic list binds to active_item_index — set it directly (do not use
+    # refresh_list_items(repoint_active=True), which preserves the previous item)
+    item_idx = ListItem.get_layer_item_index(yp.layers[idx])
+    if item_idx < 0:
+        ListItem.refresh_list_items(yp, repoint_active=False)
+        item_idx = ListItem.get_layer_item_index(yp.layers[idx])
+    if item_idx >= 0 and yp.active_item_index != item_idx:
+        # Avoid recursive layer index updates when item already maps to this layer
+        yp.halt_update = True
+        try:
+            yp.active_item_index = item_idx
+        finally:
+            yp.halt_update = False
+
+    # Force UI redraw
+    wm = bpy.context.window_manager
+    if hasattr(wm, 'ypui'):
+        wm.ypui.need_update = True
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
+            area.tag_redraw()
+
+    return True
+
+_last_path_curve_layer_sync = None
+_pending_path_curve_layer_sync = None
+
+def _deferred_path_curve_layer_sync():
+    '''Timer callback — RNA writes are unsafe directly from depsgraph/msgbus.'''
+    global _pending_path_curve_layer_sync, _last_path_curve_layer_sync
+    curve_obj = _pending_path_curve_layer_sync
+    _pending_path_curve_layer_sync = None
+    if not curve_obj:
+        return None
+    # Object may have been deleted between schedule and run
+    try:
+        _ = curve_obj.name
+    except ReferenceError:
+        _last_path_curve_layer_sync = None
+        return None
+    if select_path_bake_layer_for_curve(curve_obj):
+        _last_path_curve_layer_sync = curve_obj.as_pointer() if hasattr(curve_obj, 'as_pointer') else curve_obj.name
+    return None
+
+def sync_active_path_curve_layer_selection():
+    '''
+    If the active object is a linked path/shape curve, activate its layer.
+    Safe to call from msgbus / depsgraph handlers (defers the actual write).
+    '''
+    global _last_path_curve_layer_sync, _pending_path_curve_layer_sync
+    try:
+        obj = bpy.context.object
+    except Exception:
+        return
+    if not obj or obj.type != 'CURVE':
+        _last_path_curve_layer_sync = None
+        return
+
+    # Only for curves actually linked to a path/shape layer
+    yp, idx = find_path_bake_layer_for_curve(obj)
+    if yp is None or idx < 0:
+        _last_path_curve_layer_sync = None
+        return
+
+    key = obj.as_pointer() if hasattr(obj, 'as_pointer') else obj.name
+    if key == _last_path_curve_layer_sync and yp.active_layer_index == idx:
+        return
+
+    _pending_path_curve_layer_sync = obj
+    if not bpy.app.timers.is_registered(_deferred_path_curve_layer_sync):
+        bpy.app.timers.register(_deferred_path_curve_layer_sync, first_interval=0.0)
+
+def resolve_path_bake_mesh(obj=None):
+    '''Return a mesh suitable for path/shape baking from the active or given object.'''
+    if obj is None:
+        obj = bpy.context.object
+    if not obj:
+        return None
+    if obj.type == 'MESH':
+        return obj
+    if obj.type == 'CURVE':
+        return get_mesh_for_path_curve(obj)
+    return None
+
+def remove_path_curve_object(layer):
+    '''Unlink and delete the path/shape curve owned by this layer, if unused elsewhere.'''
+    curve_obj = get_path_curve_object(layer)
+    set_path_curve_object(layer, None)
+    if not curve_obj:
+        return
+
+    # Keep the curve if another path/shape layer still references it
+    parent = curve_obj.parent
+    if parent and parent.type == 'MESH':
+        for slot in parent.material_slots:
+            mat = slot.material
+            if not mat or not mat.node_tree:
+                continue
+            for node in mat.node_tree.nodes:
+                if node.type != 'GROUP' or not node.node_tree:
+                    continue
+                yp = getattr(node.node_tree, 'yp', None)
+                if not yp or not getattr(yp, 'is_ypaint_node', False):
+                    continue
+                for other in yp.layers:
+                    if get_path_curve_object(other) == curve_obj:
+                        return
+
+    curve_data = curve_obj.data
+    remove_datablock(bpy.data.objects, curve_obj)
+    if curve_data and curve_data.users == 0:
+        remove_datablock(bpy.data.curves, curve_data)
+
 def duplicate_path_curve_for_layer(layer, duplicated_curves=None):
     '''
     Duplicate the path/shape curve linked to a layer and reassign it.
@@ -1133,11 +1300,10 @@ class YNewPathLayer(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        obj = context.object
-        return get_active_ypaint_node() and obj and obj.type == 'MESH'
+        return get_active_ypaint_node() and resolve_path_bake_mesh(context.object) is not None
 
     def invoke(self, context, event):
-        obj = context.object
+        obj = resolve_path_bake_mesh(context.object)
         node = get_active_ypaint_node()
         yp = node.node_tree.yp
         ypup = get_user_preferences()
@@ -1162,7 +1328,7 @@ class YNewPathLayer(bpy.types.Operator):
 
     def draw(self, context):
         layout = self.layout
-        obj = context.object
+        obj = resolve_path_bake_mesh(context.object)
 
         layout.prop(self, 'name')
         layout.prop(self, 'path_mode', expand=True)
@@ -1170,19 +1336,23 @@ class YNewPathLayer(bpy.types.Operator):
         row.prop(self, 'width')
         row.prop(self, 'height')
         layout.prop(self, 'hdr')
-        if obj.type == 'MESH':
+        if obj and obj.type == 'MESH':
             layout.prop_search(self, 'uv_map', obj.data, 'uv_layers', text='UV Map', icon='GROUP_UVS')
         if self.path_mode == 'RIBBON':
             layout.prop(self, 'path_width')
 
     def execute(self, context):
         T = time.time()
-        obj = context.object
+        obj = resolve_path_bake_mesh(context.object)
         mat = get_active_material()
         node = get_active_ypaint_node()
         yp = node.node_tree.yp
         wm = context.window_manager
         ypui = wm.ypui
+
+        if not obj:
+            self.report({'ERROR'}, 'Active object must be a mesh (or its path/shape curve)')
+            return {'CANCELLED'}
 
         if not self.uv_map:
             self.report({'ERROR'}, 'UV Map is required')
@@ -1287,9 +1457,9 @@ class YBakePathToLayer(bpy.types.Operator):
         return get_path_curve_object(layer) is not None
 
     def execute(self, context):
-        obj = context.object
-        if not obj or obj.type != 'MESH':
-            self.report({'ERROR'}, 'Active object must be a mesh')
+        obj = resolve_path_bake_mesh(context.object)
+        if not obj:
+            self.report({'ERROR'}, 'Active object must be a mesh (or its path/shape curve)')
             return {'CANCELLED'}
 
         layer = getattr(context, 'layer', None)
@@ -1367,7 +1537,7 @@ class YBakeAllPaths(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        if not context.object or context.object.type != 'MESH':
+        if resolve_path_bake_mesh(context.object) is None:
             return False
         node = get_active_ypaint_node()
         if not node:
@@ -1375,8 +1545,11 @@ class YBakeAllPaths(bpy.types.Operator):
         return any(True for _ in iter_bakeable_path_layers(node.node_tree.yp))
 
     def execute(self, context):
-        obj = context.object
+        obj = resolve_path_bake_mesh(context.object)
         node = get_active_ypaint_node()
+        if not obj:
+            self.report({'ERROR'}, 'Active object must be a mesh (or its path/shape curve)')
+            return {'CANCELLED'}
         if not node:
             self.report({'ERROR'}, 'No Ucupaint node found')
             return {'CANCELLED'}
@@ -1442,9 +1615,12 @@ class YSelectPathCurve(bpy.types.Operator):
             set_object_select(o, False)
         set_object_select(curve_obj, True)
         set_active_object(curve_obj)
+        # Operator context can write RNA directly
+        global _last_path_curve_layer_sync
+        _last_path_curve_layer_sync = None
+        select_path_bake_layer_for_curve(curve_obj)
 
-        # Hint: reselect the mesh to return to the Ucupaint panel
-        self.report({'INFO'}, "Path curve selected. Reselect the mesh to show Ucupaint again.")
+        self.report({'INFO'}, "Path curve selected. UcuPaint stays on the parent mesh.")
         return {'FINISHED'}
 
 class YCreatePathCurveForLayer(bpy.types.Operator):
@@ -1455,21 +1631,21 @@ class YCreatePathCurveForLayer(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        obj = context.object
+        obj = resolve_path_bake_mesh(context.object)
         layer = getattr(context, 'layer', None)
         if not layer:
             node = get_active_ypaint_node()
             if node:
                 layer = get_active_layer(node.node_tree.yp)
-        return obj and obj.type == 'MESH' and layer and layer.type == 'IMAGE'
+        return obj is not None and layer and layer.type == 'IMAGE'
 
     def execute(self, context):
-        obj = context.object
+        obj = resolve_path_bake_mesh(context.object)
         layer = getattr(context, 'layer', None)
         if not layer:
             node = get_active_ypaint_node()
             layer = get_active_layer(node.node_tree.yp) if node else None
-        if not layer:
+        if not layer or not obj:
             return {'CANCELLED'}
 
         is_shape = layer.path_mode == 'SHAPE'

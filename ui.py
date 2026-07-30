@@ -1536,7 +1536,7 @@ def draw_root_channels_ui(context, layout, node):
                         brow.prop(channel, 'bake_to_vcol_name', text='')
 
 def draw_layer_source(context, layout, layer, layer_tree, source, image, vcol, is_a_mesh):
-    obj = context.object
+    obj = get_ypaint_ui_object(context.object)
     yp = layer.id_data.yp
     ypui = context.window_manager.ypui
     lui = ypui.layer_ui
@@ -1729,7 +1729,7 @@ def draw_layer_source(context, layout, layer, layer_tree, source, image, vcol, i
 
 def draw_layer_vector(context, layout, layer, layer_tree, source, image, vcol, is_a_mesh):
 
-    obj = context.object
+    obj = get_ypaint_ui_object(context.object)
     yp = layer.id_data.yp
     ypui = context.window_manager.ypui
     lui = ypui.layer_ui
@@ -2803,7 +2803,7 @@ def draw_layer_channels(context, layout, layer, layer_tree, image, specific_ch):
 def draw_layer_masks(context, layout, layer, specific_mask=None):
     #T = time.time()
 
-    obj = context.object
+    obj = get_ypaint_ui_object(context.object)
     yp = layer.id_data.yp
     ypui = context.window_manager.ypui
     ypup = get_user_preferences()
@@ -3462,7 +3462,7 @@ def draw_layers_ui(context, layout, node):
     yp = group_tree.yp
     ypui = context.window_manager.ypui
     ypup = get_user_preferences()
-    obj = context.object
+    obj = get_ypaint_ui_object(context.object)
     vcols = get_vertex_colors(obj)
     is_a_mesh = True if obj and obj.type == 'MESH' else False
 
@@ -4273,8 +4273,8 @@ def main_draw(self, context):
     ypui = wm.ypui
     area = context.area
     scene = context.scene
-    obj = context.object
-    mat = obj.active_material
+    obj = get_ypaint_ui_object(context.object)
+    mat = get_active_material(context.object)
     ypup = get_user_preferences()
     #slot = context.material_slot
     #space = context.space_data

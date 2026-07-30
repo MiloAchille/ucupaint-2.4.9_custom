@@ -3211,6 +3211,8 @@ def update_layer_index(self, context):
     if hasattr(bpy.context, 'object'): obj = bpy.context.object
     elif is_bl_newer_than(2, 80): obj = bpy.context.view_layer.objects.active
     if not obj: return
+    obj = get_ypaint_ui_object(obj)
+    if not obj: return
     group_tree = self.id_data
     nodes = group_tree.nodes
     ypui = context.window_manager.ypui
@@ -4568,6 +4570,10 @@ def ypaint_object_changes_update(scene):
     except: return
     if not obj: return
 
+    # Selecting a path/shape curve focuses its linked UcuPaint layer
+    from . import BakePath
+    BakePath.sync_active_path_curve_layer_selection()
+
     mat = obj.active_material
     node = get_active_ypaint_node()
     yp = node.node_tree.yp if node else None
@@ -4664,6 +4670,12 @@ def ypaint_object_changes_update(scene):
 
         if ypwm.last_mode != obj.mode:
             ypwm.last_mode = obj.mode
+
+@persistent
+def ypaint_path_curve_layer_sync(scene, depsgraph=None):
+    '''Depsgraph backup: msgbus alone can miss active-object changes in some Blender builds.'''
+    from . import BakePath
+    BakePath.sync_active_path_curve_layer_selection()
 
 @persistent
 def ypaint_missmatch_paint_slot_hack(scene):
@@ -4864,6 +4876,7 @@ def register():
         # Paint slot hack is no longer necessary with Blender 5.1
         if not is_bl_newer_than(5, 1):
             bpy.app.handlers.depsgraph_update_post.append(ypaint_missmatch_paint_slot_hack)
+        bpy.app.handlers.depsgraph_update_post.append(ypaint_path_curve_layer_sync)
     else:
         bpy.app.handlers.scene_update_pre.append(ypaint_object_changes_update)
         bpy.app.handlers.scene_update_pre.append(ypaint_hacks_and_scene_updates)
@@ -4921,6 +4934,10 @@ def unregister():
     if is_bl_newer_than(2, 80):
         if not is_bl_newer_than(5, 1):
             bpy.app.handlers.depsgraph_update_post.remove(ypaint_missmatch_paint_slot_hack)
+        try:
+            bpy.app.handlers.depsgraph_update_post.remove(ypaint_path_curve_layer_sync)
+        except ValueError:
+            pass
     else:
         bpy.app.handlers.scene_update_pre.remove(ypaint_hacks_and_scene_updates)
         bpy.app.handlers.scene_update_pre.remove(ypaint_object_changes_update)

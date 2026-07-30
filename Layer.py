@@ -4328,6 +4328,10 @@ def remove_layer(yp, index, remove_on_disk=False):
     # Dealing with decal object
     Decal.remove_decal_object(layer_tree, layer)
 
+    # Dealing with path / shape bake curve
+    if getattr(layer, 'enable_path_bake', False):
+        BakePath.remove_path_curve_object(layer)
+
     # Dealing with image atlas segments
     if layer.type == 'IMAGE': # and layer.segment_name != '':
         src = get_layer_source(layer)
