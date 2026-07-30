@@ -377,6 +377,18 @@ def draw_image_props(context, source, layout, entity=None, show_flip_y=False, sh
             text='Info: ' + str(image.size[0]) + ' x ' + str(image.size[1]) +
                 ' ' + image_format + ' ' + str(image_bit) + '-bit'
         )
+        # FILE images don't expose editable size props — offer resize here
+        if entity and getattr(entity, 'type', '') == 'IMAGE':
+            rrow = col.row(align=True)
+            rrow.context_pointer_set('layer', entity)
+            if image:
+                # Prefer path-bake resize when this is a path/shape layer
+                if getattr(entity, 'enable_path_bake', False):
+                    rrow.operator('wm.y_resize_path_bake_image', text='Resize Image', icon='FULLSCREEN_ENTER')
+                else:
+                    op = rrow.operator('wm.y_resize_image', text='Resize Image', icon='FULLSCREEN_ENTER')
+                    op.layer_name = entity.name
+                    op.image_name = image.name
 
     split = split_layout(col, 0.4)
 

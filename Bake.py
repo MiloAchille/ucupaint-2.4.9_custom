@@ -714,7 +714,13 @@ class YResizeImage(bpy.types.Operator, BaseBakeOperator):
 
     @classmethod
     def poll(cls, context):
-        return get_active_ypaint_node() and context.object.type == 'MESH'
+        if not get_active_ypaint_node() or not context.object:
+            return False
+        # Allow when a path/shape curve is selected (UI remaps to parent mesh)
+        from . import BakePath
+        if BakePath.resolve_path_bake_mesh(context.object) is not None:
+            return True
+        return context.object.type == 'MESH'
 
     def invoke(self, context, event):
         self.invoke_operator(context)

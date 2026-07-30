@@ -2291,6 +2291,118 @@ class YBakeAllPaths(bpy.types.Operator):
             self.report({'INFO'}, summary)
         return {'FINISHED'}
 
+class YResizePathBakeImage(bpy.types.Operator):
+    '''Change the resolution of this path/shape layer's bake image'''
+    bl_idname = 'wm.y_resize_path_bake_image'
+    bl_label = 'Resize Bake Image'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    width : IntProperty(name='Width', default=1024, min=1, max=16384)
+    height : IntProperty(name='Height', default=1024, min=1, max=16384)
+    rebake : BoolProperty(
+        name = 'Rebake After Resize',
+        description = 'Bake the path/shape again after changing image size',
+        default = True
+    )
+
+    @classmethod
+    def poll(cls, context):
+        layer = getattr(context, 'layer', None)
+        if not layer:
+            node = get_active_ypaint_node()
+            if node:
+                layer = get_active_layer(node.node_tree.yp)
+        if not layer or layer.type != 'IMAGE' or not getattr(layer, 'enable_path_bake', False):
+            return False
+        source = get_layer_source(layer)
+        return bool(source and source.image)
+
+    def invoke(self, context, event):
+        layer = getattr(context, 'layer', None)
+        if not layer:
+            node = get_active_ypaint_node()
+            layer = get_active_layer(node.node_tree.yp) if node else None
+        source = get_layer_source(layer) if layer else None
+        image = source.image if source else None
+        if image and image.size[0] > 0 and image.size[1] > 0:
+            self.width = image.size[0]
+            self.height = image.size[1]
+        return context.window_manager.invoke_props_dialog(self, width=280)
+
+    def draw(self, context):
+        layout = self.layout
+        row = layout.row(align=True)
+        row.prop(self, 'width')
+        row.prop(self, 'height')
+        layout.prop(self, 'rebake')
+
+    def execute(self, context):
+        layer = getattr(context, 'layer', None)
+        if not layer:
+            node = get_active_ypaint_node()
+            layer = get_active_layer(node.node_tree.yp) if node else None
+        if not layer:
+            self.report({'ERROR'}, 'No active layer')
+            return {'CANCELLED'}
+
+        source = get_layer_source(layer)
+        image = source.image if source else None
+        if not image:
+            self.report({'ERROR'}, 'Layer has no image')
+            return {'CANCELLED'}
+
+        if image.size[0] == self.width and image.size[1] == self.height:
+            self.report({'INFO'}, 'Image already has this size')
+            return {'CANCELLED'}
+
+        # Prefer Blender's image.scale when available
+        try:
+            if hasattr(image, 'scale'):
+                image.scale(self.width, self.height)
+            else:
+                # Fallback via UV editor resize (same approach as wm.y_resize_image)
+                area = context.area
+                ori_ui_type = getattr(area, 'ui_type', None) if area else None
+                if area and hasattr(area, 'ui_type'):
+                    area.ui_type = 'UV'
+                    if hasattr(context, 'space_data') and context.space_data:
+                        context.space_data.image = image
+                    bpy.ops.image.resize(size=(self.width, self.height))
+                    if ori_ui_type is not None:
+                        area.ui_type = ori_ui_type
+                else:
+                    self.report({'ERROR'}, 'Could not resize image in this context')
+                    return {'CANCELLED'}
+        except Exception as e:
+            self.report({'ERROR'}, 'Resize failed: %s' % str(e))
+            return {'CANCELLED'}
+
+        if image.source == 'GENERATED':
+            if hasattr(image, 'generated_width'):
+                image.generated_width = self.width
+            if hasattr(image, 'generated_height'):
+                image.generated_height = self.height
+
+        image.update()
+
+        msg = 'Resized bake image to %d x %d' % (self.width, self.height)
+        if self.rebake:
+            obj = resolve_path_bake_mesh(context.object)
+            if not obj:
+                self.report({'WARNING'}, msg + ' (rebake skipped: no mesh)')
+                return {'FINISHED'}
+            ok, bake_msg = bake_layer_path(obj, layer)
+            if ok:
+                self.report({'INFO'}, msg + ' and rebaked')
+            else:
+                self.report({'WARNING'}, msg + ' but rebake failed: %s' % bake_msg)
+        else:
+            self.report({'INFO'}, msg + ' — bake again to refresh content')
+
+        for area in context.screen.areas:
+            area.tag_redraw()
+        return {'FINISHED'}
+
 class YSelectPathCurve(bpy.types.Operator):
     '''Select the path curve object linked to this layer'''
     bl_idname = 'wm.y_select_path_curve'
@@ -2417,6 +2529,17 @@ def draw_path_bake_ui(layout, context, layer):
     method_row.prop(layer, 'path_shrinkwrap_method', expand=True)
 
     col.separator()
+    # Bake image resolution (Layer Source Info is read-only for FILE images)
+    source = get_layer_source(layer)
+    bake_img = source.image if source else None
+    size_row = col.row(align=True)
+    if bake_img and bake_img.size[0] > 0:
+        size_row.label(text='Image: %d x %d' % (bake_img.size[0], bake_img.size[1]))
+    else:
+        size_row.label(text='Image: -')
+    size_row.context_pointer_set('layer', layer)
+    size_row.operator('wm.y_resize_path_bake_image', text='Resize', icon='FULLSCREEN_ENTER')
+
     col.prop(layer, 'path_resolution')
     if is_shape:
         col.prop(layer, 'path_shape_feather')
@@ -2458,6 +2581,7 @@ def register():
     bpy.utils.register_class(YNewPathLayer)
     bpy.utils.register_class(YBakePathToLayer)
     bpy.utils.register_class(YBakeAllPaths)
+    bpy.utils.register_class(YResizePathBakeImage)
     bpy.utils.register_class(YSelectPathCurve)
     bpy.utils.register_class(YCreatePathCurveForLayer)
 
@@ -2465,5 +2589,6 @@ def unregister():
     bpy.utils.unregister_class(YNewPathLayer)
     bpy.utils.unregister_class(YBakePathToLayer)
     bpy.utils.unregister_class(YBakeAllPaths)
+    bpy.utils.unregister_class(YResizePathBakeImage)
     bpy.utils.unregister_class(YSelectPathCurve)
     bpy.utils.unregister_class(YCreatePathCurveForLayer)
