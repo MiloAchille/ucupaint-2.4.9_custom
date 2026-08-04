@@ -1,6 +1,6 @@
 import bpy, math, time
 import numpy
-from mathutils import Vector
+from mathutils import Vector, Matrix
 from mathutils.bvhtree import BVHTree
 from bpy.props import *
 from .common import *
@@ -914,6 +914,115 @@ def _nearest_uv(bvh, tris, point, max_dist=None):
 
     return loc, n, Vector((uv.x, uv.y)), dist
 
+def _uv_from_tri_hit(tris, loc, normal, index, dist):
+    if index < 0 or index >= len(tris):
+        return None
+    v0, v1, v2, uv0, uv1, uv2, face_n = tris[index]
+    try:
+        uv = _barycentric_uv(loc, v0, v1, v2, uv0, uv1, uv2)
+    except Exception:
+        uv = (uv0 + uv1 + uv2) / 3.0
+    n = face_n if face_n.length > 1e-8 else Vector(normal)
+    if n.length > 1e-8:
+        n.normalize()
+    else:
+        n = Vector((0, 0, 1))
+    return loc, n, Vector((uv.x, uv.y)), dist
+
+def _raycast_uv_along_dir(bvh, tris, point, direction, max_dist):
+    '''
+    Raycast ± along direction (shape plane normal) and return the closest hit UV.
+    Matches Shrinkwrap Project with +/- and no axis.
+    '''
+    if direction.length < 1e-8:
+        return None
+    d = direction.normalized()
+    max_dist = float(max_dist) if max_dist is not None else 1.0
+    best = None
+    for sign in (1.0, -1.0):
+        # Start slightly behind the point so coplanar/on-surface points still hit
+        origin = point - d * sign * min(max_dist * 0.001, 1e-4)
+        try:
+            hit = bvh.ray_cast(origin, d * sign, max_dist)
+        except Exception:
+            hit = None
+        if not hit or hit[0] is None:
+            continue
+        loc, normal, index, dist = hit
+        # Distance from original point
+        dist_from_p = (Vector(loc) - point).length
+        if best is None or dist_from_p < best[3]:
+            mapped = _uv_from_tri_hit(tris, Vector(loc), normal, index, dist_from_p)
+            if mapped:
+                best = mapped
+    return best
+
+def _project_shape_polyline_project_to_uv(polyline, bvh, tris, project_distance):
+    '''
+    Project-mode UV mapping: raycast each authored point along the shape plane
+    normal (±). Misses (overhang past the mesh) are filled with a plane->UV
+    affine trained only on successful ray hits.
+
+    Avoids the old full-affine path that warped multi-island / non-linear UVs
+    into fan-shaped garbage.
+    '''
+    if len(polyline) < 3:
+        return [], 0
+
+    center, axis_u, axis_v, plane_n = _fit_polyline_plane(polyline)
+
+    def to_plane(p):
+        d = p - center
+        return (d.dot(axis_u), d.dot(axis_v))
+
+    uvs = [None] * len(polyline)
+    fit_pts = []
+    fit_uvs = []
+    seam_jumps = 0
+    prev_uv = None
+    for i, p in enumerate(polyline):
+        hit = _raycast_uv_along_dir(bvh, tris, p, plane_n, project_distance)
+        if not hit:
+            continue
+        _loc, _n, uv, _dist = hit
+        uvs[i] = uv.copy()
+        fit_pts.append(p)
+        fit_uvs.append(uv)
+        if prev_uv is not None and (uv - prev_uv).length > 0.25:
+            seam_jumps += 1
+        prev_uv = uv
+
+    misses = [i for i, uv in enumerate(uvs) if uv is None]
+    xu = xv = None
+    if misses and len(fit_pts) >= 3:
+        A = numpy.array([[to_plane(p)[0], to_plane(p)[1], 1.0] for p in fit_pts], dtype=numpy.float64)
+        bu = numpy.array([uv.x for uv in fit_uvs], dtype=numpy.float64)
+        bv = numpy.array([uv.y for uv in fit_uvs], dtype=numpy.float64)
+        try:
+            xu, _, _, _ = numpy.linalg.lstsq(A, bu, rcond=None)
+            xv, _, _, _ = numpy.linalg.lstsq(A, bv, rcond=None)
+        except Exception:
+            xu = xv = None
+
+    if xu is not None and xv is not None:
+        for i in misses:
+            s, t = to_plane(polyline[i])
+            uvs[i] = Vector((
+                float(xu[0] * s + xu[1] * t + xu[2]),
+                float(xv[0] * s + xv[1] * t + xv[2]),
+            ))
+
+    # Any remaining gaps: nearest as last resort (keeps polygon closed)
+    out = []
+    for i, p in enumerate(polyline):
+        if uvs[i] is not None:
+            out.append(uvs[i])
+            continue
+        hit = _nearest_uv(bvh, tris, p, max_dist=project_distance)
+        if hit:
+            out.append(hit[2].copy())
+    return out, seam_jumps
+
 def _barycentric_uv(p, a, b, c, uva, uvb, uvc):
     v0 = b - a
     v1 = c - a
@@ -931,430 +1040,206 @@ def _barycentric_uv(p, a, b, c, uva, uvb, uvc):
     u = 1.0 - v - w
     return uva * u + uvb * v + uvc * w
 
-# ---------------------------------------------------------------------------
-# Surface-space bake core
-#
-# Stamping curve samples into UV can never be exact: the result depends on the
-# sample spacing and every curve point has to guess a UV. These helpers invert
-# the mapping — each texel that belongs to the mesh is turned back into its 3D
-# surface position and tested against the real curve geometry, so a bake is the
-# true footprint of the curve on the surface.
-# ---------------------------------------------------------------------------
-
-_MAX_SURFACE_TEXELS = 8000000
-_OCCLUSION_TEST_LIMIT = 60000
-
-def _falloff_profile(dist, half_width, power=1.0):
-    '''Cross-section opacity: 1 at the center, 0 at the edge.'''
-    t = numpy.clip(dist / max(float(half_width), 1e-12), 0.0, 1.0)
+def _soft_falloff(t, power=1.0):
+    '''t in 0..1 (0=center, 1=edge). Returns opacity.'''
+    t = max(0.0, min(1.0, t))
+    # Hard edge when falloff is 0
+    if power <= 0.0:
+        return 1.0 if t < 1.0 - 1e-6 else 0.0
+    # Smoothstep-like edge
     a = 1.0 - t * t * (3.0 - 2.0 * t)
     if power != 1.0:
-        a = numpy.power(numpy.maximum(a, 0.0), max(float(power), 1e-4))
-    return a.astype(numpy.float32)
+        a = pow(max(a, 0.0), power)
+    return a
 
-def _tris_to_arrays(tris):
-    '''Triangle soup as arrays: verts (T,3,3), uvs (T,3,2), unit normals (T,3).'''
-    verts = numpy.array(
-        [[[t[0].x, t[0].y, t[0].z],
-          [t[1].x, t[1].y, t[1].z],
-          [t[2].x, t[2].y, t[2].z]] for t in tris],
-        dtype=numpy.float32
-    )
-    uvs = numpy.array(
-        [[[t[3].x, t[3].y], [t[4].x, t[4].y], [t[5].x, t[5].y]] for t in tris],
-        dtype=numpy.float32
-    )
-    nrms = numpy.array([[t[6].x, t[6].y, t[6].z] for t in tris], dtype=numpy.float32)
-    lens = numpy.linalg.norm(nrms, axis=1)
-    lens[lens < 1e-12] = 1.0
-    nrms /= lens[:, None]
-    return verts, uvs, nrms
+def _blend_pixel(pxs, px, py, rgba, strength):
+    if strength <= 1e-6:
+        return
+    cr, cg, cb, ca = rgba
+    a = ca * strength
+    if a <= 1e-6:
+        return
+    dst = pxs[py, px]
+    out_a = a + dst[3] * (1.0 - a)
+    if out_a > 1e-6:
+        pxs[py, px, 0] = (cr * a + dst[0] * dst[3] * (1.0 - a)) / out_a
+        pxs[py, px, 1] = (cg * a + dst[1] * dst[3] * (1.0 - a)) / out_a
+        pxs[py, px, 2] = (cb * a + dst[2] * dst[3] * (1.0 - a)) / out_a
+        pxs[py, px, 3] = min(1.0, out_a)
+    else:
+        pxs[py, px, 3] = 0.0
 
-def _tris_near_points(bvh, tri_count, points, radius):
-    '''Triangle indices within radius of any point (None if BVH lacks range query).'''
-    query = getattr(bvh, 'find_nearest_range', None)
-    if not query:
+def _splat_rgba(pxs, width, height, u, v, rgba, strength, radius_px=1.0):
+    '''Stamp into float32 array shaped (height, width, 4), with optional brush radius in pixels.'''
+    if strength <= 1e-6:
+        return
+    if u < 0.0 or u > 1.0 or v < 0.0 or v > 1.0:
+        return
+
+    x = u * (width - 1)
+    y = v * (height - 1)
+    radius = max(0.75, float(radius_px))
+    r_ceil = int(math.ceil(radius)) + 1
+    x0 = max(0, int(math.floor(x)) - r_ceil)
+    x1 = min(width - 1, int(math.ceil(x)) + r_ceil)
+    y0 = max(0, int(math.floor(y)) - r_ceil)
+    y1 = min(height - 1, int(math.ceil(y)) + r_ceil)
+    r2 = radius * radius
+
+    for py in range(y0, y1 + 1):
+        for px in range(x0, x1 + 1):
+            dx = px - x
+            dy = py - y
+            d2 = dx * dx + dy * dy
+            if d2 > r2:
+                continue
+            # Soft disk falloff inside brush
+            w = 1.0 - math.sqrt(d2) / radius
+            w = w * w
+            _blend_pixel(pxs, px, py, rgba, strength * w)
+
+def _splat_coverage_max(cov, width, height, u, v, strength, radius_px=1.25):
+    '''Max-blend soft coverage stamp — no alpha-over banding between overlaps.'''
+    if strength <= 1e-6:
+        return
+    if u < 0.0 or u > 1.0 or v < 0.0 or v > 1.0:
+        return
+    x = u * (width - 1)
+    y = v * (height - 1)
+    radius = max(0.75, float(radius_px))
+    r_ceil = int(math.ceil(radius)) + 1
+    x0 = max(0, int(math.floor(x)) - r_ceil)
+    x1 = min(width - 1, int(math.ceil(x)) + r_ceil)
+    y0 = max(0, int(math.floor(y)) - r_ceil)
+    y1 = min(height - 1, int(math.ceil(y)) + r_ceil)
+    inv_r = 1.0 / radius
+    for py in range(y0, y1 + 1):
+        for px in range(x0, x1 + 1):
+            dx = px - x
+            dy = py - y
+            d = math.sqrt(dx * dx + dy * dy) * inv_r
+            if d > 1.0:
+                continue
+            w = 1.0 - d
+            w = w * w
+            val = strength * w
+            if val > cov[py, px]:
+                cov[py, px] = val
+
+def _barycentric_2d(px, py, ax, ay, bx, by, cx, cy):
+    v0x, v0y = bx - ax, by - ay
+    v1x, v1y = cx - ax, cy - ay
+    v2x, v2y = px - ax, py - ay
+    den = v0x * v1y - v1x * v0y
+    if abs(den) < 1e-12:
         return None
-    found = set()
-    for p in points:
+    inv = 1.0 / den
+    v = (v2x * v1y - v1x * v2y) * inv
+    w = (v0x * v2y - v2x * v0y) * inv
+    u = 1.0 - v - w
+    return u, v, w
+
+def _fill_uv_tri_coverage(cov, img_w, img_h, uv_a, s_a, uv_b, s_b, uv_c, s_c):
+    '''Rasterize a UV triangle into a coverage buffer with interpolated strength.'''
+    ax, ay = uv_a.x * (img_w - 1), uv_a.y * (img_h - 1)
+    bx, by = uv_b.x * (img_w - 1), uv_b.y * (img_h - 1)
+    cx, cy = uv_c.x * (img_w - 1), uv_c.y * (img_h - 1)
+    min_x = max(0, int(math.floor(min(ax, bx, cx))))
+    max_x = min(img_w - 1, int(math.ceil(max(ax, bx, cx))))
+    min_y = max(0, int(math.floor(min(ay, by, cy))))
+    max_y = min(img_h - 1, int(math.ceil(max(ay, by, cy))))
+    if min_x > max_x or min_y > max_y:
+        return 0
+    filled = 0
+    for py in range(min_y, max_y + 1):
+        # Sample at pixel centers
+        fy = py + 0.5
+        for px in range(min_x, max_x + 1):
+            fx = px + 0.5
+            bary = _barycentric_2d(fx, fy, ax, ay, bx, by, cx, cy)
+            if not bary:
+                continue
+            u, v, w = bary
+            if u < -1e-4 or v < -1e-4 or w < -1e-4:
+                continue
+            s = s_a * u + s_b * v + s_c * w
+            if s <= 1e-6:
+                continue
+            if s > cov[py, px]:
+                cov[py, px] = s
+                filled += 1
+    return filled
+
+def _fill_uv_quad_coverage(cov, img_w, img_h, uv00, s00, uv10, s10, uv11, s11, uv01, s01):
+    '''Fill UV quad (00-10-11-01) as two triangles into coverage.'''
+    n = _fill_uv_tri_coverage(cov, img_w, img_h, uv00, s00, uv10, s10, uv11, s11)
+    n += _fill_uv_tri_coverage(cov, img_w, img_h, uv00, s00, uv11, s11, uv01, s01)
+    return n
+
+def _parallel_transport_side(prev_side, prev_tangent, tangent):
+    '''Carry ribbon side along the path so mesh-normal flips don't invert the frame.'''
+    if prev_side is None or prev_tangent is None or tangent is None:
+        return None
+    if prev_tangent.length < 1e-8 or tangent.length < 1e-8:
+        return None
+    t0 = prev_tangent.normalized()
+    t1 = tangent.normalized()
+    side = prev_side.copy()
+    axis = t0.cross(t1)
+    if axis.length > 1e-8:
         try:
-            hits = query(p, radius)
+            angle = t0.angle(t1)
         except Exception:
-            return None
-        if not hits:
-            continue
-        for hit in hits:
-            index = hit[2] if hit else None
-            if index is not None and 0 <= index < tri_count:
-                found.add(index)
-    if not found:
-        return numpy.zeros(0, dtype=numpy.int64)
-    return numpy.fromiter(sorted(found), dtype=numpy.int64, count=len(found))
-
-def _gather_surface_texels(tri_indices, verts, uvs, nrms, img_w, img_h, dilate_px=0.7):
-    '''
-    Rasterize triangles in UV space and map every covered texel back onto the
-    surface. Returns (ys, xs, points, normals, world_per_px) or None.
-    '''
-    tri_idx = numpy.asarray(tri_indices)
-    if tri_idx.size == 0:
+            angle = 0.0
+        if abs(angle) > 1e-8:
+            side = Matrix.Rotation(angle, 3, axis.normalized()) @ side
+    elif t0.dot(t1) < 0.0:
+        side = -side
+    side = side - t1 * side.dot(t1)
+    if side.length < 1e-8:
         return None
+    return side.normalized()
 
-    # Everything that does not depend on the texel grid is done in one batch
-    tri_v = verts[tri_idx].astype(numpy.float64)
-    tri_uv = uvs[tri_idx].astype(numpy.float64)
-    px = tri_uv[:, :, 0] * img_w
-    py = tri_uv[:, :, 1] * img_h
-    ax, bx, cx = px[:, 0], px[:, 1], px[:, 2]
-    ay, by, cy = py[:, 0], py[:, 1], py[:, 2]
+def _sample_path_texture(tex_pxs, tw, th, u_len, v_across, tile_u=1.0, rotation_deg=0.0):
+    '''Sample path stamp texture. u_len 0..1 along path, v_across -1..1 across width.'''
+    uu = (u_len * tile_u) % 1.0
+    if uu < 0.0:
+        uu += 1.0
+    vv = v_across * 0.5 + 0.5
 
-    area2 = numpy.abs((by - cy) * (ax - cx) + (cx - bx) * (ay - cy))
-    safe_area2 = numpy.maximum(area2, 1e-12)
-    # Only triangles that are mapped inside this UV tile can be baked
-    on_sheet = (
-        (px.max(axis=1) >= -dilate_px) & (px.min(axis=1) <= img_w + dilate_px)
-        & (py.max(axis=1) >= -dilate_px) & (py.min(axis=1) <= img_h + dilate_px)
-    )
-    inv_den = numpy.where(
-        on_sheet & (area2 > 1e-12),
-        1.0 / numpy.where(area2 > 1e-12, (by - cy) * (ax - cx) + (cx - bx) * (ay - cy), 1.0),
-        0.0
-    )
-    # Grow each triangle by dilate_px so UV island borders leave no gap
-    tol0 = dilate_px * numpy.hypot(bx - cx, by - cy) / safe_area2
-    tol1 = dilate_px * numpy.hypot(cx - ax, cy - ay) / safe_area2
-    tol2 = dilate_px * numpy.hypot(ax - bx, ay - by) / safe_area2
-
-    edge_a = tri_v[:, 1] - tri_v[:, 0]
-    edge_b = tri_v[:, 2] - tri_v[:, 0]
-    crs_x = edge_a[:, 1] * edge_b[:, 2] - edge_a[:, 2] * edge_b[:, 1]
-    crs_y = edge_a[:, 2] * edge_b[:, 0] - edge_a[:, 0] * edge_b[:, 2]
-    crs_z = edge_a[:, 0] * edge_b[:, 1] - edge_a[:, 1] * edge_b[:, 0]
-    area_3d = 0.5 * numpy.sqrt(crs_x * crs_x + crs_y * crs_y + crs_z * crs_z)
-    scale = numpy.sqrt(numpy.maximum(area_3d, 1e-20) / (0.5 * safe_area2))
-
-    bx0 = numpy.clip(numpy.floor(px.min(axis=1) - dilate_px - 1.0), 0, img_w - 1)
-    bx1 = numpy.clip(numpy.ceil(px.max(axis=1) + dilate_px + 1.0), 0, img_w - 1)
-    by0 = numpy.clip(numpy.floor(py.min(axis=1) - dilate_px - 1.0), 0, img_h - 1)
-    by1 = numpy.clip(numpy.ceil(py.max(axis=1) + dilate_px + 1.0), 0, img_h - 1)
-
-    l_ax, l_bx, l_cx = ax.tolist(), bx.tolist(), cx.tolist()
-    l_ay, l_by, l_cy = ay.tolist(), by.tolist(), cy.tolist()
-    l_inv = inv_den.tolist()
-    l_t0, l_t1, l_t2 = tol0.tolist(), tol1.tolist(), tol2.tolist()
-    l_scale = scale.tolist()
-    l_x0, l_x1 = bx0.astype(numpy.int64).tolist(), bx1.astype(numpy.int64).tolist()
-    l_y0, l_y1 = by0.astype(numpy.int64).tolist(), by1.astype(numpy.int64).tolist()
-
-    ys_all = []
-    xs_all = []
-    pts_all = []
-    nrm_all = []
-    scale_all = []
-    total = 0
-
-    for i in range(tri_idx.shape[0]):
-        inv = l_inv[i]
-        if inv == 0.0:
-            continue
-        x0, x1 = l_x0[i], l_x1[i]
-        y0, y1 = l_y0[i], l_y1[i]
-        if x1 < x0 or y1 < y0:
-            continue
-
-        p_ax, p_bx, p_cx = l_ax[i], l_bx[i], l_cx[i]
-        p_ay, p_by, p_cy = l_ay[i], l_by[i], l_cy[i]
-
-        # Barycentric coordinates of every texel center in the bounding box
-        gx = numpy.arange(x0, x1 + 1, dtype=numpy.float64) + (0.5 - p_cx)
-        gy = numpy.arange(y0, y1 + 1, dtype=numpy.float64) + (0.5 - p_cy)
-        w0 = ((p_by - p_cy) * gx[None, :] + (p_cx - p_bx) * gy[:, None]) * inv
-        w1 = ((p_cy - p_ay) * gx[None, :] + (p_ax - p_cx) * gy[:, None]) * inv
-        w2 = 1.0 - w0 - w1
-
-        covered = (w0 >= -l_t0[i]) & (w1 >= -l_t1[i]) & (w2 >= -l_t2[i])
-        rows, cols = numpy.nonzero(covered)
-        if rows.size == 0:
-            continue
-
-        b0 = numpy.clip(w0[rows, cols], 0.0, 1.0)
-        b1 = numpy.clip(w1[rows, cols], 0.0, 1.0)
-        b2 = numpy.clip(w2[rows, cols], 0.0, 1.0)
-        wsum = b0 + b1 + b2
-        wsum[wsum < 1e-12] = 1.0
-        b0 /= wsum
-        b1 /= wsum
-        b2 /= wsum
-
-        tri = tri_v[i]
-        pts = (b0[:, None] * tri[0][None, :]
-               + b1[:, None] * tri[1][None, :]
-               + b2[:, None] * tri[2][None, :])
-        count = pts.shape[0]
-
-        ys_all.append((rows + y0).astype(numpy.int32))
-        xs_all.append((cols + x0).astype(numpy.int32))
-        pts_all.append(pts.astype(numpy.float32))
-        nrm_all.append(numpy.broadcast_to(nrms[tri_idx[i]], (count, 3)))
-        scale_all.append(numpy.full(count, l_scale[i], dtype=numpy.float32))
-
-        total += count
-        if total >= _MAX_SURFACE_TEXELS:
-            break
-
-    if not ys_all:
-        return None
-    return (
-        numpy.concatenate(ys_all),
-        numpy.concatenate(xs_all),
-        numpy.concatenate(pts_all),
-        numpy.concatenate(nrm_all),
-        numpy.concatenate(scale_all),
-    )
-
-def _uv_tri_texel_area(uvs, tri_idx, img_w, img_h):
-    '''Doubled texel-space area of each triangle.'''
-    tuv = uvs[tri_idx].astype(numpy.float64)
-    px = tuv[:, :, 0] * img_w
-    py = tuv[:, :, 1] * img_h
-    return numpy.abs(
-        (py[:, 1] - py[:, 2]) * (px[:, 0] - px[:, 2])
-        + (px[:, 2] - px[:, 1]) * (py[:, 0] - py[:, 2])
-    )
-
-def _median_texel_size(verts, uvs, tri_idx, img_w, img_h):
-    '''Median world size of one texel over the given triangles.'''
-    if tri_idx.size == 0:
-        return 0.0
-    area2 = _uv_tri_texel_area(uvs, tri_idx, img_w, img_h)
-    tv = verts[tri_idx].astype(numpy.float64)
-    edge_a = tv[:, 1] - tv[:, 0]
-    edge_b = tv[:, 2] - tv[:, 0]
-    crs_x = edge_a[:, 1] * edge_b[:, 2] - edge_a[:, 2] * edge_b[:, 1]
-    crs_y = edge_a[:, 2] * edge_b[:, 0] - edge_a[:, 0] * edge_b[:, 2]
-    crs_z = edge_a[:, 0] * edge_b[:, 1] - edge_a[:, 1] * edge_b[:, 0]
-    area_3d2 = numpy.sqrt(crs_x * crs_x + crs_y * crs_y + crs_z * crs_z)
-    valid = area2 > 1e-9
-    if not numpy.any(valid):
-        return 0.0
-    return float(numpy.median(numpy.sqrt(area_3d2[valid] / area2[valid])))
-
-def _batch_tri_indices(uvs, tri_idx, img_w, img_h, max_texels=2000000):
-    '''Split candidate triangles into batches with a bounded texel count.'''
-    if tri_idx.size == 0:
-        return []
-    cost = _uv_tri_texel_area(uvs, tri_idx, img_w, img_h) * 0.5 + 8.0
-    groups = numpy.floor(numpy.cumsum(cost) / float(max_texels)).astype(numpy.int64)
-    edges = numpy.nonzero(numpy.diff(groups))[0] + 1
-    return numpy.split(tri_idx, edges)
-
-def _polyline_to_segments(points, cyclic):
-    '''(start, delta, delta^2, length, arc start, total length) segment arrays.'''
-    coords = numpy.array([[p.x, p.y, p.z] for p in points], dtype=numpy.float32)
-    if cyclic and coords.shape[0] >= 3:
-        coords = numpy.vstack([coords, coords[:1]])
-    if coords.shape[0] < 2:
-        return None
-    start = coords[:-1]
-    delta = coords[1:] - start
-    delta2 = numpy.maximum(numpy.einsum('ij,ij->i', delta, delta), 1e-20).astype(numpy.float32)
-    length = numpy.sqrt(delta2).astype(numpy.float32)
-    arc_start = numpy.concatenate([
-        numpy.zeros(1, dtype=numpy.float32), numpy.cumsum(length)[:-1]
-    ]).astype(numpy.float32)
-    return start, delta, delta2, length, arc_start, float(length.sum())
-
-def _closest_on_polyline(points, segments, search_radius, chunk_elems=1500000):
-    '''
-    Closest point on the polyline for every point.
-    Returns (distance, arc length, segment t, segment index, closest point).
-    Distance stays inf where no segment is within search_radius.
-    '''
-    start, delta, delta2, seg_len, arc_start, _total = segments
-    count = points.shape[0]
-    seg_count = start.shape[0]
-
-    dist = numpy.full(count, numpy.inf, dtype=numpy.float32)
-    arc = numpy.zeros(count, dtype=numpy.float32)
-    seg_t = numpy.zeros(count, dtype=numpy.float32)
-    seg_i = numpy.zeros(count, dtype=numpy.int32)
-    closest = numpy.zeros((count, 3), dtype=numpy.float32)
-
-    end = start + delta
-    box_min = numpy.minimum(start, end) - search_radius
-    box_max = numpy.maximum(start, end) + search_radius
-
-    # Bucket the points spatially, so each batch only has to test the handful of
-    # segments that reach its own neighbourhood
-    cell = max(float(search_radius) * 2.0, 1e-9)
-    keys = numpy.floor(points / cell).astype(numpy.int64)
-    order = numpy.lexsort((keys[:, 2], keys[:, 1], keys[:, 0]))
-    sorted_keys = keys[order]
-    if count > 1:
-        edges = numpy.nonzero(numpy.any(numpy.diff(sorted_keys, axis=0) != 0, axis=1))[0] + 1
-        buckets = numpy.split(order, edges)
+    if rotation_deg:
+        rad = math.radians(rotation_deg)
+        cos_a = math.cos(rad)
+        sin_a = math.sin(rad)
+        x = uu - 0.5
+        y = vv - 0.5
+        uu = x * cos_a - y * sin_a + 0.5
+        vv = x * sin_a + y * cos_a + 0.5
+        # Wrap so rotated tiles still repeat cleanly
+        uu = uu % 1.0
+        if uu < 0.0:
+            uu += 1.0
+        vv = vv % 1.0
+        if vv < 0.0:
+            vv += 1.0
     else:
-        buckets = [order]
+        vv = max(0.0, min(1.0, vv))
 
-    for bucket in buckets:
-        bucket_pts = points[bucket]
-        lo = bucket_pts.min(axis=0)
-        hi = bucket_pts.max(axis=0)
-        near = numpy.nonzero(numpy.all((box_max >= lo) & (box_min <= hi), axis=1))[0]
-        if near.size == 0:
-            continue
-
-        seg_a = start[near]
-        seg_d = delta[near]
-        seg_2 = delta2[near]
-        step = max(256, int(chunk_elems // near.size))
-        for base in range(0, bucket.shape[0], step):
-            where = bucket[base:base + step]
-            chunk = points[where]
-            rel = chunk[:, None, :] - seg_a[None, :, :]
-            t = numpy.einsum('msk,sk->ms', rel, seg_d) / seg_2[None, :]
-            numpy.clip(t, 0.0, 1.0, out=t)
-            proj = seg_a[None, :, :] + t[:, :, None] * seg_d[None, :, :]
-            diff = chunk[:, None, :] - proj
-            d2 = numpy.einsum('msk,msk->ms', diff, diff)
-
-            best = numpy.argmin(d2, axis=1)
-            rows = numpy.arange(chunk.shape[0])
-            picked = near[best]
-            best_t = t[rows, best]
-            dist[where] = numpy.sqrt(d2[rows, best])
-            seg_t[where] = best_t
-            seg_i[where] = picked
-            arc[where] = arc_start[picked] + best_t * seg_len[picked]
-            closest[where] = proj[rows, best]
-
-    return dist, arc, seg_t, seg_i, closest
-
-def _reject_occluded(bvh, origins, targets):
-    '''True where the mesh blocks the straight line from origin to target.'''
-    count = targets.shape[0]
-    blocked = numpy.zeros(count, dtype=bool)
-    if count == 0 or count > _OCCLUSION_TEST_LIMIT:
-        return blocked
-    for i in range(count):
-        origin = Vector((float(origins[i, 0]), float(origins[i, 1]), float(origins[i, 2])))
-        target = Vector((float(targets[i, 0]), float(targets[i, 1]), float(targets[i, 2])))
-        ray = target - origin
-        span = ray.length
-        if span < 1e-6:
-            continue
-        ray /= span
-        try:
-            hit = bvh.ray_cast(origin + ray * (span * 0.03), ray, span * 0.92)
-        except Exception:
-            hit = None
-        if hit and hit[0] is not None:
-            blocked[i] = True
-    return blocked
-
-class _BakeAccumulator:
-    '''Collects texel coverage from every loop, then resolves it per texel.'''
-
-    def __init__(self, img_w, img_h, use_texture):
-        self.img_w = img_w
-        self.img_h = img_h
-        self.use_texture = use_texture
-        self.count = 0
-        self._ys = []
-        self._xs = []
-        self._alpha = []
-        self._rgb = []
-
-    def add(self, ys, xs, alpha, rgb=None):
-        keep = alpha > 1e-4
-        kept = int(numpy.count_nonzero(keep))
-        if kept == 0:
-            return 0
-        self._ys.append(ys[keep])
-        self._xs.append(xs[keep])
-        self._alpha.append(alpha[keep].astype(numpy.float32))
-        if self.use_texture:
-            if rgb is None:
-                self._rgb.append(numpy.ones((kept, 3), dtype=numpy.float32))
-            else:
-                self._rgb.append(rgb[keep].astype(numpy.float32))
-        self.count += kept
-        return kept
-
-    def resolve(self):
-        '''(coverage, rgb) buffers — the strongest sample wins each texel.'''
-        coverage = numpy.zeros((self.img_h, self.img_w), dtype=numpy.float32)
-        if not self._ys:
-            return coverage, None
-        ys = numpy.concatenate(self._ys)
-        xs = numpy.concatenate(self._xs)
-        alpha = numpy.concatenate(self._alpha)
-        numpy.maximum.at(coverage, (ys, xs), alpha)
-        rgb_buf = None
-        if self.use_texture and self._rgb:
-            rgb_buf = numpy.zeros((self.img_h, self.img_w, 3), dtype=numpy.float32)
-            order = numpy.argsort(alpha, kind='stable')
-            rgb_buf[ys[order], xs[order]] = numpy.concatenate(self._rgb)[order]
-        return coverage, rgb_buf
-
-def _read_image_pixels(image, img_w, img_h):
-    if is_bl_newer_than(2, 83):
-        pxs = numpy.empty(shape=img_w * img_h * 4, dtype=numpy.float32)
-        image.pixels.foreach_get(pxs)
-    else:
-        pxs = numpy.array(image.pixels[:], dtype=numpy.float32)
-    pxs.shape = (img_h, img_w, 4)
-    return pxs
-
-def _write_image_pixels(image, pxs):
-    flat = pxs.ravel()
-    if is_bl_newer_than(2, 83):
-        image.pixels.foreach_set(flat)
-    else:
-        image.pixels = flat.tolist()
-    image.update()
-
-def _load_texture_pixels(path_texture):
-    '''(pixels (h,w,4), width, height) for an optional stamp texture.'''
-    if not path_texture or path_texture.size[0] < 1 or path_texture.size[1] < 1:
-        return None, 0, 0
-    tw, th = path_texture.size[0], path_texture.size[1]
-    if is_bl_newer_than(2, 83):
-        tex_pxs = numpy.empty(shape=tw * th * 4, dtype=numpy.float32)
-        path_texture.pixels.foreach_get(tex_pxs)
-    else:
-        tex_pxs = numpy.array(path_texture.pixels[:], dtype=numpy.float32)
-    tex_pxs.shape = (th, tw, 4)
-    return tex_pxs, tw, th
-
-def _composite_bake(pxs, coverage, rgb_buf, color, clear):
-    '''Blend a coverage buffer into the destination pixels.'''
-    cr, cg, cb, ca = [float(c) for c in color]
-    src_a = numpy.clip(coverage * ca, 0.0, 1.0).astype(numpy.float32)
-    touched = src_a > 1e-5
-    tint = numpy.array((cr, cg, cb), dtype=numpy.float32)
-    if rgb_buf is not None:
-        src_rgb = rgb_buf * tint[None, None, :]
-    else:
-        src_rgb = numpy.broadcast_to(tint, (pxs.shape[0], pxs.shape[1], 3))
-
-    if clear:
-        for ch in range(3):
-            pxs[:, :, ch] = numpy.where(touched, src_rgb[:, :, ch], 0.0)
-        pxs[:, :, 3] = numpy.where(touched, src_a, 0.0)
-        return int(numpy.count_nonzero(touched))
-
-    dst_a = pxs[:, :, 3].copy()
-    out_a = src_a + dst_a * (1.0 - src_a)
-    safe = numpy.maximum(out_a, 1e-8)
-    for ch in range(3):
-        pxs[:, :, ch] = numpy.where(
-            touched,
-            (src_rgb[:, :, ch] * src_a + pxs[:, :, ch] * dst_a * (1.0 - src_a)) / safe,
-            pxs[:, :, ch],
-        )
-    pxs[:, :, 3] = numpy.where(touched, numpy.minimum(out_a, 1.0), dst_a)
-    return int(numpy.count_nonzero(touched))
+    x = uu * (tw - 1)
+    y = vv * (th - 1)
+    x0 = int(math.floor(x))
+    y0 = int(math.floor(y))
+    x1 = min(x0 + 1, tw - 1)
+    y1 = min(y0 + 1, th - 1)
+    fx = x - x0
+    fy = y - y0
+    c00 = tex_pxs[y0, x0]
+    c10 = tex_pxs[y0, x1]
+    c01 = tex_pxs[y1, x0]
+    c11 = tex_pxs[y1, x1]
+    c0 = c00 * (1 - fx) + c10 * fx
+    c1 = c01 * (1 - fx) + c11 * fx
+    return c0 * (1 - fy) + c1 * fy
 
 def _sample_path_texture_batch(tex_pxs, tw, th, u_len, v_across, tile_u=1.0, rotation_deg=0.0):
     '''Vectorized bilinear texture sample. u_len/v_across are 1D float arrays.'''
@@ -1393,6 +1278,28 @@ def _sample_path_texture_batch(tex_pxs, tw, th, u_len, v_across, tile_u=1.0, rot
     c1 = c01 * (1.0 - fx) + c11 * fx
     return c0 * (1.0 - fy) + c1 * fy
 
+def _uv_pixel_dist(uv_a, uv_b, img_w, img_h):
+    dx = (uv_a.x - uv_b.x) * (img_w - 1)
+    dy = (uv_a.y - uv_b.y) * (img_h - 1)
+    return math.sqrt(dx * dx + dy * dy)
+
+def _project_polyline_to_uv(polyline, bvh, tris, project_distance):
+    uvs = []
+    seam_jumps = 0
+    prev = None
+    for p in polyline:
+        hit = _nearest_uv(bvh, tris, p, max_dist=project_distance)
+        if not hit:
+            continue
+        _, _, uv, _ = hit
+        if prev is not None:
+            # Rough seam detection in UV units
+            if (uv - prev).length > 0.25:
+                seam_jumps += 1
+        uvs.append(uv.copy())
+        prev = uv
+    return uvs, seam_jumps
+
 def _fit_polyline_plane(polyline):
     '''Return (center, axis_u, axis_v, normal) for the best-fit plane of the polyline.'''
     n = len(polyline)
@@ -1428,57 +1335,260 @@ def _fit_polyline_plane(polyline):
         axis_v.normalize()
     return center, axis_u, axis_v, normal
 
-def _decimate_points(points, max_points):
-    '''Uniformly thin a point list — keeps the shape, caps the field cost.'''
-    count = len(points)
-    if count <= max_points:
-        return list(points)
-    step = count / float(max_points)
-    return [points[min(count - 1, int(i * step))] for i in range(max_points)]
+def _project_shape_polyline_to_uv(polyline, bvh, tris, project_distance,
+                                  preserve_silhouette=False):
+    '''
+    Map a closed world-space shape into UV continuously (Nearest / hybrid).
 
-def _rasterize_polygon_grid(poly_x, poly_y, grid_w, grid_h):
-    '''Even-odd fill of a closed polygon given in grid coordinates.'''
-    mask = numpy.zeros((grid_h, grid_w), dtype=numpy.float32)
-    if poly_x.shape[0] < 3 or grid_w < 1 or grid_h < 1:
+    On-mesh points keep nearest UVs; clear overhangs use plane->UV affine.
+    For Project mode prefer _project_shape_polyline_project_to_uv (raycast).
+    '''
+    if len(polyline) < 3:
+        return [], 0
+
+    center, axis_u, axis_v, _normal = _fit_polyline_plane(polyline)
+
+    def to_plane(p):
+        d = p - center
+        return (d.dot(axis_u), d.dot(axis_v))
+
+    # Per-point hits (None if no hit within project_distance)
+    point_hits = []  # list of (uv, dist) or None
+    hit_dists = []
+    hits = []  # (index, p, uv, dist)
+    prev_uv = None
+    seam_jumps = 0
+    for i, p in enumerate(polyline):
+        hit = _nearest_uv(bvh, tris, p, max_dist=project_distance)
+        if not hit:
+            point_hits.append(None)
+            continue
+        _loc, _n, uv, dist = hit
+        point_hits.append((uv.copy(), dist))
+        hit_dists.append(dist)
+        hits.append((i, p, uv, dist))
+        if prev_uv is not None and (uv - prev_uv).length > 0.25:
+            seam_jumps += 1
+        prev_uv = uv
+
+    if len(hits) < 3:
+        return _project_polyline_to_uv(polyline, bvh, tris, project_distance)
+
+    sorted_d = sorted(hit_dists)
+    median = sorted_d[len(sorted_d) // 2]
+    on_thresh = max(median * 6.0, sorted_d[0] * 12.0, 1e-5)
+    if project_distance is not None:
+        on_thresh = min(on_thresh, max(project_distance * 0.35, median * 3.0 + 1e-6))
+
+    overhang_indices = set()
+    for i, ph in enumerate(point_hits):
+        if ph is None or ph[1] > on_thresh:
+            overhang_indices.add(i)
+
+    # Hybrid only: no clear overhang → pure nearest
+    if not preserve_silhouette and len(overhang_indices) < 3:
+        uvs = []
+        for ph in point_hits:
+            if ph is not None:
+                uvs.append(ph[0].copy())
+        if len(uvs) < 3:
+            return _project_polyline_to_uv(polyline, bvh, tris, project_distance)
+        return uvs, seam_jumps
+
+    # Train affine from on-surface samples (closest hits for Project / overhang)
+    samples_st = []
+    samples_uv = []
+    for _i, p, uv, dist in hits:
+        if not preserve_silhouette and dist > on_thresh:
+            continue
+        # For Project silhouette: prefer closer hits as trainers, still allow all
+        samples_st.append(to_plane(p))
+        samples_uv.append((uv.x, uv.y))
+
+    if preserve_silhouette:
+        # Prefer the closest third of hits so edge-collapsed far points don't bias the fit
+        closest = sorted(hits, key=lambda h: h[3])[:max(3, max(3, len(hits) // 2))]
+        samples_st = []
+        samples_uv = []
+        for _i, p, uv, _dist in closest:
+            samples_st.append(to_plane(p))
+            samples_uv.append((uv.x, uv.y))
+    elif len(samples_st) < 3:
+        closest = sorted(hits, key=lambda h: h[3])[:max(3, len(hits) // 3)]
+        samples_st = []
+        samples_uv = []
+        for _i, p, uv, _dist in closest:
+            samples_st.append(to_plane(p))
+            samples_uv.append((uv.x, uv.y))
+
+    xu = xv = None
+    affine_ok = False
+    if len(samples_st) >= 3:
+        A = numpy.array([[s, t, 1.0] for s, t in samples_st], dtype=numpy.float64)
+        bu = numpy.array([uv[0] for uv in samples_uv], dtype=numpy.float64)
+        bv = numpy.array([uv[1] for uv in samples_uv], dtype=numpy.float64)
+        try:
+            xu, _, _, _ = numpy.linalg.lstsq(A, bu, rcond=None)
+            xv, _, _, _ = numpy.linalg.lstsq(A, bv, rcond=None)
+            pred_u = A @ xu
+            pred_v = A @ xv
+            err = float(numpy.sqrt(numpy.mean((pred_u - bu) ** 2 + (pred_v - bv) ** 2)))
+            if preserve_silhouette:
+                # Project must keep silhouette even across mild unwrap distortion
+                affine_ok = err <= 0.20
+            else:
+                affine_ok = err <= 0.08 and seam_jumps < 3
+        except Exception:
+            affine_ok = False
+
+    if not affine_ok:
+        if preserve_silhouette:
+            # Last resort for Project: still try affine from all hits (ignore residual)
+            try:
+                A = numpy.array([[to_plane(p)[0], to_plane(p)[1], 1.0] for _i, p, _uv, _d in hits], dtype=numpy.float64)
+                bu = numpy.array([uv.x for _i, _p, uv, _d in hits], dtype=numpy.float64)
+                bv = numpy.array([uv.y for _i, _p, uv, _d in hits], dtype=numpy.float64)
+                xu, _, _, _ = numpy.linalg.lstsq(A, bu, rcond=None)
+                xv, _, _, _ = numpy.linalg.lstsq(A, bv, rcond=None)
+                affine_ok = True
+            except Exception:
+                affine_ok = False
+        if not affine_ok:
+            uvs = []
+            for ph in point_hits:
+                if ph is not None:
+                    uvs.append(ph[0].copy())
+            if len(uvs) < 3:
+                return _project_polyline_to_uv(polyline, bvh, tris, project_distance)
+            return uvs, seam_jumps
+
+    def affine_uv(p):
+        s, t = to_plane(p)
+        return Vector((
+            float(xu[0] * s + xu[1] * t + xu[2]),
+            float(xv[0] * s + xv[1] * t + xv[2]),
+        ))
+
+    # Project: every outline point through affine (preserves authored silhouette)
+    if preserve_silhouette:
+        return [affine_uv(p) for p in polyline], seam_jumps
+
+    # Hybrid: nearest on-mesh, affine only for clear overhang / missed points
+    uvs = []
+    for i, p in enumerate(polyline):
+        if i in overhang_indices:
+            uvs.append(affine_uv(p))
+        else:
+            ph = point_hits[i]
+            uvs.append(ph[0].copy() if ph is not None else affine_uv(p))
+    return uvs, seam_jumps
+
+def _decimate_poly(poly, max_points=96):
+    '''Keep polygon under max_points by uniform stride (closed loop).'''
+    n = len(poly)
+    if n <= max_points:
+        return poly
+    step = n / float(max_points)
+    out = [poly[int(i * step) % n] for i in range(max_points)]
+    return out
+
+def _densify_poly_edges(poly, max_edge_px=2.0):
+    '''Subdivide long polygon edges so scanline fill follows the outline tightly.'''
+    n = len(poly)
+    if n < 3:
+        return poly
+    out = []
+    max_edge = max(0.5, float(max_edge_px))
+    for i in range(n):
+        x0, y0 = poly[i]
+        x1, y1 = poly[(i + 1) % n]
+        out.append((x0, y0))
+        dx = x1 - x0
+        dy = y1 - y0
+        dist = math.sqrt(dx * dx + dy * dy)
+        if dist <= max_edge:
+            continue
+        steps = int(math.ceil(dist / max_edge))
+        for s in range(1, steps):
+            t = s / float(steps)
+            out.append((x0 + dx * t, y0 + dy * t))
+    return out
+
+def _inflate_poly(poly, amount_px):
+    '''Push polygon vertices outward along averaged edge normals (pixel space).'''
+    n = len(poly)
+    if n < 3 or abs(amount_px) < 1e-8:
+        return poly
+
+    # Signed area to know winding. Image Y grows downward, so the geometric
+    # left-of-edge normal for a CCW poly points inward — flip for outward.
+    area = 0.0
+    for i in range(n):
+        x0, y0 = poly[i]
+        x1, y1 = poly[(i + 1) % n]
+        area += x0 * y1 - x1 * y0
+    sign = -1.0 if area >= 0.0 else 1.0
+
+    out = []
+    for i in range(n):
+        x_prev, y_prev = poly[(i - 1) % n]
+        x, y = poly[i]
+        x_next, y_next = poly[(i + 1) % n]
+
+        e0x, e0y = x - x_prev, y - y_prev
+        e1x, e1y = x_next - x, y_next - y
+        l0 = math.sqrt(e0x * e0x + e0y * e0y) or 1.0
+        l1 = math.sqrt(e1x * e1x + e1y * e1y) or 1.0
+        # Inward normals of incoming/outgoing edges, then flip to outward
+        n0x, n0y = -sign * e0y / l0, sign * e0x / l0
+        n1x, n1y = -sign * e1y / l1, sign * e1x / l1
+        nx, ny = n0x + n1x, n0y + n1y
+        nl = math.sqrt(nx * nx + ny * ny)
+        if nl < 1e-8:
+            nx, ny = n0x, n0y
+            nl = math.sqrt(nx * nx + ny * ny) or 1.0
+        nx /= nl
+        ny /= nl
+        out.append((x + nx * amount_px, y + ny * amount_px))
+    return out
+
+def _scanline_fill_mask(poly, img_w, img_h, min_x, max_x, min_y, max_y):
+    '''Fast even-odd scanline fill into a float mask (img_h, img_w).
+
+    Uses pixel-center coverage on both axes (x+0.5, y+0.5).
+    '''
+    mask = numpy.zeros((img_h, img_w), dtype=numpy.float32)
+    n = len(poly)
+    if n < 3:
         return mask
 
-    x0 = poly_x.astype(numpy.float64)
-    y0 = poly_y.astype(numpy.float64)
-    x1 = numpy.roll(x0, -1)
-    y1 = numpy.roll(y0, -1)
-    rows = numpy.arange(grid_h, dtype=numpy.float64) + 0.5
-
-    spans = (y0[None, :] > rows[:, None]) != (y1[None, :] > rows[:, None])
-    row_idx, edge_idx = numpy.nonzero(spans)
-    if row_idx.size == 0:
-        return mask
-
-    dy = (y1 - y0)[edge_idx]
-    dy = numpy.where(numpy.abs(dy) < 1e-12, 1e-12, dy)
-    cross_x = x0[edge_idx] + (rows[row_idx] - y0[edge_idx]) / dy * (x1 - x0)[edge_idx]
-    # Every crossing toggles the cells whose center sits to its right
-    col = numpy.ceil(cross_x - 0.5).astype(numpy.int64)
-    numpy.clip(col, 0, grid_w, out=col)
-    toggles = numpy.zeros((grid_h, grid_w + 1), dtype=numpy.int32)
-    numpy.add.at(toggles, (row_idx, col), 1)
-    parity = numpy.cumsum(toggles, axis=1) & 1
-    mask[:] = parity[:, :grid_w].astype(numpy.float32)
+    for y in range(min_y, max_y + 1):
+        y_c = y + 0.5
+        hits = []
+        j = n - 1
+        for i in range(n):
+            x0, y0 = poly[j]
+            x1, y1 = poly[i]
+            if (y0 > y_c) != (y1 > y_c):
+                denom = y1 - y0
+                if abs(denom) < 1e-30:
+                    denom = 1e-30
+                hits.append(x0 + (y_c - y0) / denom * (x1 - x0))
+            j = i
+        if len(hits) < 2:
+            continue
+        hits.sort()
+        for k in range(0, len(hits) - 1, 2):
+            x_a = hits[k]
+            x_b = hits[k + 1]
+            if x_b < x_a:
+                x_a, x_b = x_b, x_a
+            # Pixel x is covered when its center x+0.5 lies strictly inside (x_a, x_b)
+            x0 = max(min_x, int(math.ceil(x_a - 0.5)))
+            x1 = min(max_x, int(math.floor(x_b - 0.5)))
+            if x1 >= x0:
+                mask[y, x0:x1 + 1] = 1.0
     return mask
-
-def _sample_grid_bilinear(grid, gx, gy):
-    '''Bilinear lookup in a (h, w) grid at continuous grid coordinates.'''
-    grid_h, grid_w = grid.shape
-    x = numpy.clip(gx - 0.5, 0.0, grid_w - 1.0)
-    y = numpy.clip(gy - 0.5, 0.0, grid_h - 1.0)
-    x0 = numpy.floor(x).astype(numpy.int32)
-    y0 = numpy.floor(y).astype(numpy.int32)
-    x1 = numpy.minimum(x0 + 1, grid_w - 1)
-    y1 = numpy.minimum(y0 + 1, grid_h - 1)
-    fx = (x - x0).astype(numpy.float32)
-    fy = (y - y0).astype(numpy.float32)
-    top = grid[y0, x0] * (1.0 - fx) + grid[y0, x1] * fx
-    bottom = grid[y1, x0] * (1.0 - fx) + grid[y1, x1] * fx
-    return top * (1.0 - fy) + bottom * fy
 
 def _box_blur_mask(mask, radius):
     '''Separable box blur for soft shape edges. radius in pixels.'''
@@ -1507,11 +1617,7 @@ def bake_shape_to_image(obj, image, curve_obj, uv_name, resolution,
                         feather_px=2.0, project_distance=None,
                         shrinkwrap_method=None):
     '''
-    Fill a closed (cyclic) curve onto the UV image as a solid vector shape.
-
-    The outline is fitted to its own plane and every surface texel under that
-    plane is tested against the real outline, so the fill matches the curve
-    exactly — including the parts that overhang the mesh silhouette.
+    Project a closed (cyclic) curve to UV and fill it as a solid vector shape.
     Returns (ok, message).
 
     shrinkwrap_method: 'NEAREST_SURFACEPOINT' | 'PROJECT' | None (read from modifier)
@@ -1542,183 +1648,205 @@ def bake_shape_to_image(obj, image, curve_obj, uv_name, resolution,
         method = method.upper()
     use_project = (method == 'PROJECT')
 
-    obj_dim = max(obj.dimensions) if obj.dimensions.length > 0 else 1.0
     if project_distance is None:
-        project_distance = max(obj_dim * 0.5, 0.1)
+        dim = max(obj.dimensions) if obj.dimensions.length > 0 else 1.0
+        project_distance = max(dim * 0.5, 0.1)
 
-    # Project keeps the authored outline, Nearest uses the surface-snapped one
+    def _close_loop(pts):
+        if len(pts) < 3:
+            return pts
+        if (pts[0] - pts[-1]).length > 1e-6:
+            return list(pts) + [pts[0].copy()]
+        return pts
+
+    def _count_overhang(pts):
+        if len(pts) < 3:
+            return 0
+        dists = []
+        misses = 0
+        for p in pts:
+            hit = _nearest_uv(bvh, tris, p, max_dist=project_distance)
+            if not hit:
+                misses += 1
+                continue
+            dists.append(hit[3])
+        if len(dists) < 3:
+            return misses
+        sd = sorted(dists)
+        median = sd[len(sd) // 2]
+        thresh = max(median * 6.0, sd[0] * 12.0, 1e-5)
+        if project_distance is not None:
+            thresh = min(thresh, max(project_distance * 0.35, median * 3.0 + 1e-6))
+        n_far = sum(1 for d in dists if d > thresh)
+        return n_far + misses
+
+    # Authored loops always; Nearest also builds surface-snapped loops
+    authored_loops = [_close_loop(L) for L in _sample_bezier_math_loops(curve_obj, shape_res) if len(L) >= 3]
     if use_project:
-        loops = _sample_bezier_math_loops(curve_obj, shape_res)
+        # Project: bake the authored silhouette (matches Project viewport intent)
+        source_loops = authored_loops
     else:
-        loops = _curve_to_polylines(
-            curve_obj, resolution=shape_res, shrinkwrap_method='NEAREST_SURFACEPOINT'
-        )
-        if not loops:
-            loops = _sample_bezier_math_loops(curve_obj, shape_res)
-    loops = [loop for loop in loops if len(loop) >= 3]
-    if not loops:
-        return False, 'Closed shape needs at least 3 points'
+        source_loops = [
+            _close_loop(L) for L in _curve_to_polylines(
+                curve_obj, resolution=shape_res, shrinkwrap_method='NEAREST_SURFACEPOINT'
+            ) if len(L) >= 3
+        ]
+        if not source_loops:
+            source_loops = authored_loops
 
-    verts, tri_uvs, tri_nrms = _tris_to_arrays(tris)
-    tex_pxs, tw, th = _load_texture_pixels(path_texture)
-    use_tex = tex_pxs is not None
+    if not source_loops:
+        return False, 'Closed shape needs at least 3 projected points'
 
-    accum = _BakeAccumulator(img_w, img_h, use_tex)
     feather = max(0.0, float(feather_px))
+    max_poly = min(max(shape_res, 64), 1024)
+    mask = numpy.zeros((img_h, img_w), dtype=numpy.float32)
+    seam_jumps = 0
+    all_uvs = []
+    all_xs = []
+    all_ys = []
     loops_baked = 0
 
-    for loop in loops:
-        outline = list(loop)
-        if len(outline) >= 4 and (outline[0] - outline[-1]).length < 1e-6:
-            outline = outline[:-1]
-        outline = _decimate_points(outline, 512)
-        if len(outline) < 3:
-            continue
-
-        center, axis_u, axis_v, plane_n = _fit_polyline_plane(outline)
-
-        # Face the outline plane the same way as the surface it sits on
-        surface_n = Vector((0.0, 0.0, 0.0))
-        stride = max(1, len(outline) // 24)
-        for p in outline[::stride]:
-            hit = _nearest_uv(bvh, tris, p, max_dist=project_distance)
-            if hit:
-                surface_n += hit[1]
-        if surface_n.length > 1e-8 and surface_n.dot(plane_n) < 0.0:
-            plane_n = -plane_n
-            axis_v = -axis_v
-
-        origin_np = numpy.array((center.x, center.y, center.z), dtype=numpy.float32)
-        u_np = numpy.array((axis_u.x, axis_u.y, axis_u.z), dtype=numpy.float32)
-        v_np = numpy.array((axis_v.x, axis_v.y, axis_v.z), dtype=numpy.float32)
-        n_np = numpy.array((plane_n.x, plane_n.y, plane_n.z), dtype=numpy.float32)
-
-        loop_rel = numpy.array(
-            [[p.x, p.y, p.z] for p in outline], dtype=numpy.float32
-        ) - origin_np
-        loop_u = loop_rel @ u_np
-        loop_v = loop_rel @ v_np
-        loop_depth = loop_rel @ n_np
-
-        u_min, u_max = float(loop_u.min()), float(loop_u.max())
-        v_min, v_max = float(loop_v.min()), float(loop_v.max())
-        span_u = max(u_max - u_min, 1e-6)
-        span_v = max(v_max - v_min, 1e-6)
-        extent = max(span_u, span_v)
-        wobble = float(numpy.abs(loop_depth).max())
-        # How far the surface may curve away from the outline plane
-        depth_limit = max(wobble * 3.0 + extent * 0.35, obj_dim * 0.01, 1e-5)
-
-        # Candidate triangles: inside the outline prism and facing the plane
-        tri_rel = verts - origin_np
-        tri_u = tri_rel @ u_np
-        tri_v = tri_rel @ v_np
-        tri_d = tri_rel @ n_np
-        pad = extent * 0.02 + 1e-6
-        candidates = (
-            (tri_u.max(axis=1) >= u_min - pad) & (tri_u.min(axis=1) <= u_max + pad)
-            & (tri_v.max(axis=1) >= v_min - pad) & (tri_v.min(axis=1) <= v_max + pad)
-            & (tri_d.max(axis=1) >= -depth_limit) & (tri_d.min(axis=1) <= depth_limit)
-            & ((tri_nrms @ n_np) > -0.15)
-        )
-        cand_idx = numpy.nonzero(candidates)[0]
-        if cand_idx.size == 0:
-            continue
-
-        # Outline mask in plane space, finer than a texel so edges stay crisp
-        texel = _median_texel_size(verts, tri_uvs, cand_idx, img_w, img_h)
-        if texel <= 0.0:
-            continue
-        cell = max(texel * 0.45, extent * 1e-4)
-        feather_world = feather * texel
-        margin = feather_world * 2.5 + cell * 4.0
-        grid_w = int(math.ceil((span_u + margin * 2.0) / cell)) + 1
-        grid_h = int(math.ceil((span_v + margin * 2.0) / cell)) + 1
-        max_cells = 8000000
-        if grid_w * grid_h > max_cells:
-            cell *= math.sqrt(float(grid_w) * float(grid_h) / max_cells)
-            grid_w = int(math.ceil((span_u + margin * 2.0) / cell)) + 1
-            grid_h = int(math.ceil((span_v + margin * 2.0) / cell)) + 1
-        grid_u0 = u_min - margin
-        grid_v0 = v_min - margin
-
-        mask = _rasterize_polygon_grid(
-            (loop_u - grid_u0) / cell, (loop_v - grid_v0) / cell, grid_w, grid_h
-        )
-        if feather_world > cell:
-            mask = _box_blur_mask(mask, feather_world / cell)
-        if falloff <= 0.0:
-            mask = (mask >= 0.5).astype(numpy.float32)
-        elif falloff != 1.0:
-            mask = numpy.power(numpy.clip(mask, 0.0, 1.0), float(falloff)).astype(numpy.float32)
-
-        visible_depth = max(wobble * 1.5, extent * 0.05, texel * 2.0)
-        loop_pixels = 0
-
-        for batch in _batch_tri_indices(tri_uvs, cand_idx, img_w, img_h):
-            gathered = _gather_surface_texels(batch, verts, tri_uvs, tri_nrms, img_w, img_h)
-            if gathered is None:
-                continue
-            ys, xs, pts, nrm, _scale = gathered
-
-            rel = pts - origin_np
-            p_u = rel @ u_np
-            p_v = rel @ v_np
-            p_d = rel @ n_np
-
-            keep = (numpy.abs(p_d) <= depth_limit) & ((nrm @ n_np) > -0.15)
-            if not numpy.any(keep):
-                continue
-            ys = ys[keep]
-            xs = xs[keep]
-            pts = pts[keep]
-            p_u = p_u[keep]
-            p_v = p_v[keep]
-            p_d = p_d[keep]
-
-            gx = (p_u - grid_u0) / cell
-            gy = (p_v - grid_v0) / cell
-            alpha = _sample_grid_bilinear(mask, gx, gy)
-            alpha = numpy.where(
-                (gx >= 0.0) & (gx <= grid_w) & (gy >= 0.0) & (gy <= grid_h), alpha, 0.0
-            ).astype(numpy.float32)
-
-            # Surface that sits well off the plane has to be visible from it
-            far_idx = numpy.nonzero((alpha > 1e-4) & (numpy.abs(p_d) > visible_depth))[0]
-            if far_idx.size:
-                plane_pts = pts[far_idx] - p_d[far_idx][:, None] * n_np[None, :]
-                blocked = _reject_occluded(bvh, plane_pts, pts[far_idx])
-                alpha[far_idx[blocked]] = 0.0
-
-            rgb = None
-            if use_tex:
-                sampled = _sample_path_texture_batch(
-                    tex_pxs, tw, th,
-                    (p_u - u_min) / span_u, (p_v - v_min) / span_v * 2.0 - 1.0,
-                    tile_u=tile_u, rotation_deg=rotation_deg
+    for li, polyline in enumerate(source_loops):
+        authored = authored_loops[li] if li < len(authored_loops) else polyline
+        if use_project:
+            # Raycast ± along shape plane normal (true Project); affine only for misses
+            uvs, jumps = _project_shape_polyline_project_to_uv(
+                authored, bvh, tris, project_distance
+            )
+        else:
+            use_overhang = len(authored) >= 3 and _count_overhang(authored) >= 3
+            if use_overhang:
+                uvs, jumps = _project_shape_polyline_to_uv(
+                    authored, bvh, tris, project_distance, preserve_silhouette=False
                 )
-                alpha = alpha * sampled[:, 3]
-                rgb = sampled[:, :3]
+            else:
+                uvs, jumps = _project_polyline_to_uv(polyline, bvh, tris, project_distance)
+        seam_jumps += jumps
+        if len(uvs) < 3:
+            continue
+        if (uvs[0] - uvs[-1]).length < 1e-6:
+            uvs = uvs[:-1]
+        if len(uvs) < 3:
+            continue
 
-            loop_pixels += accum.add(ys, xs, alpha, rgb)
+        poly = [(uv.x * img_w, uv.y * img_h) for uv in uvs]
+        poly = _decimate_poly(poly, max_points=max_poly)
+        poly = _densify_poly_edges(poly, max_edge_px=1.5)
+        if feather <= 0.5:
+            poly = _inflate_poly(poly, 0.6)
 
-        if loop_pixels:
-            loops_baked += 1
+        xs = [p[0] for p in poly]
+        ys = [p[1] for p in poly]
+        pad = int(math.ceil(max(feather, 0.6))) + 2
+        min_x = max(0, int(math.floor(min(xs) - pad)))
+        max_x = min(img_w - 1, int(math.ceil(max(xs) + pad)))
+        min_y = max(0, int(math.floor(min(ys) - pad)))
+        max_y = min(img_h - 1, int(math.ceil(max(ys) + pad)))
 
-    if accum.count == 0:
-        return False, 'Shape did not cover any pixels (check curve position / UV map)'
+        loop_mask = _scanline_fill_mask(poly, img_w, img_h, min_x, max_x, min_y, max_y)
+        if feather > 0.5:
+            crop = loop_mask[min_y:max_y + 1, min_x:max_x + 1]
+            crop = _box_blur_mask(crop, feather)
+            if falloff <= 0.0:
+                crop = (crop >= 0.5).astype(numpy.float32)
+            elif falloff != 1.0:
+                crop = numpy.power(numpy.clip(crop, 0.0, 1.0), float(falloff)).astype(numpy.float32)
+            loop_mask[min_y:max_y + 1, min_x:max_x + 1] = crop
 
-    coverage, rgb_buf = accum.resolve()
-    pxs = _read_image_pixels(image, img_w, img_h)
-    filled = _composite_bake(pxs, coverage, rgb_buf, color, clear)
-    _write_image_pixels(image, pxs)
+        numpy.maximum(mask, loop_mask, out=mask)
+        all_uvs.extend(uvs)
+        all_xs.extend(xs)
+        all_ys.extend(ys)
+        loops_baked += 1
 
-    msg = 'Filled shape (%d loop%s, %d / %d pixels) [%s]' % (
-        loops_baked, 's' if loops_baked != 1 else '', filled, img_w * img_h,
-        'Project' if use_project else 'Nearest'
+    if loops_baked == 0 or not all_xs:
+        return False, 'Could not project the shape onto the mesh UVs'
+
+    uvs = all_uvs
+    xs = all_xs
+    ys = all_ys
+
+    if is_bl_newer_than(2, 83):
+        pxs = numpy.empty(shape=img_w * img_h * 4, dtype=numpy.float32)
+        image.pixels.foreach_get(pxs)
+    else:
+        pxs = numpy.array(image.pixels[:], dtype=numpy.float32)
+    pxs.shape = (img_h, img_w, 4)
+
+    if clear:
+        pxs[:] = 0.0
+
+    cr, cg, cb, ca = [float(c) for c in color]
+    alpha = mask * ca
+    filled = int(numpy.count_nonzero(alpha > 1e-4))
+    if filled == 0:
+        return False, 'Shape did not cover any pixels (check UV projection / curve position)'
+
+    tex_pxs = None
+    tw = th = 0
+    if path_texture and path_texture.size[0] > 0 and path_texture.size[1] > 0:
+        tw, th = path_texture.size[0], path_texture.size[1]
+        if is_bl_newer_than(2, 83):
+            tex_pxs = numpy.empty(shape=tw * th * 4, dtype=numpy.float32)
+            path_texture.pixels.foreach_get(tex_pxs)
+        else:
+            tex_pxs = numpy.array(path_texture.pixels[:], dtype=numpy.float32)
+        tex_pxs.shape = (th, tw, 4)
+
+    if tex_pxs is None:
+        # Solid fill — vectorized over (only where shape contributes)
+        m = alpha > 1e-4
+        if numpy.any(m):
+            src_a = alpha[m]
+            dst_a = pxs[:, :, 3][m]
+            out_a = src_a + dst_a * (1.0 - src_a)
+            safe = numpy.maximum(out_a, 1e-8)
+            for ch, cval in enumerate((cr, cg, cb)):
+                dst_c = pxs[:, :, ch][m]
+                pxs[:, :, ch][m] = (cval * src_a + dst_c * dst_a * (1.0 - src_a)) / safe
+            pxs[:, :, 3][m] = numpy.minimum(out_a, 1.0)
+    else:
+        # Textured fill — vectorized bilinear sample + blend (was a slow Python loop)
+        bbox_w = max(max(xs) - min(xs), 1e-6)
+        bbox_h = max(max(ys) - min(ys), 1e-6)
+        m = alpha > 1e-4
+        ys_idx, xs_idx = numpy.nonzero(m)
+        if len(xs_idx):
+            u_local = (xs_idx.astype(numpy.float32) + 0.5 - min(xs)) / bbox_w
+            v_local = (ys_idx.astype(numpy.float32) + 0.5 - min(ys)) / bbox_h
+            sampled = _sample_path_texture_batch(
+                tex_pxs, tw, th, u_local, v_local * 2.0 - 1.0,
+                tile_u=tile_u, rotation_deg=rotation_deg
+            )
+            # Matches previous per-pixel path: strength = mask, src_a = tex_a * alpha
+            src_a = sampled[:, 3] * alpha[ys_idx, xs_idx]
+            dst_a = pxs[ys_idx, xs_idx, 3]
+            out_a = src_a + dst_a * (1.0 - src_a)
+            safe = numpy.maximum(out_a, 1e-8)
+            for ch, cval in enumerate((cr, cg, cb)):
+                src_c = sampled[:, ch] * cval
+                dst_c = pxs[ys_idx, xs_idx, ch]
+                pxs[ys_idx, xs_idx, ch] = (src_c * src_a + dst_c * dst_a * (1.0 - src_a)) / safe
+            pxs[ys_idx, xs_idx, 3] = numpy.minimum(out_a, 1.0)
+
+    flat = pxs.ravel()
+    if is_bl_newer_than(2, 83):
+        image.pixels.foreach_set(flat)
+    else:
+        image.pixels = flat.tolist()
+    image.update()
+
+    total = img_w * img_h
+    msg = 'Filled shape (%d loop%s, %d / %d pixels)' % (
+        loops_baked, 's' if loops_baked != 1 else '', filled, total
     )
-    if loops_baked < len(loops):
-        msg += ' — %d loop(s) found no surface' % (len(loops) - loops_baked)
+    msg += ' [%s]' % ('Project' if use_project else 'Nearest')
+    uv_xs = [uv.x for uv in uvs]
+    uv_ys = [uv.y for uv in uvs]
+    if min(uv_xs) < -0.01 or max(uv_xs) > 1.01 or min(uv_ys) < -0.01 or max(uv_ys) > 1.01:
+        msg += ' — overhangs UV sheet'
+    if seam_jumps > 0:
+        msg += ' — warning: %d UV seam jumps (shape may look wrong across islands)' % seam_jumps
     return True, msg
 
 def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_samples,
@@ -1727,12 +1855,7 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
                        project_distance=None, fill_gaps=True, mode='RIBBON',
                        feather_px=2.0, shrinkwrap_method=None):
     '''
-    Bake a ribbon (or a filled closed shape) from a real 3D curve onto a UV image.
-
-    The ribbon is the surface footprint of the curve: every texel is measured
-    against the curve itself, so opacity is even and the edges land exactly at
-    half the path width. width_samples / fill_gaps are kept for older callers
-    and no longer change the result.
+    Stamp a ribbon or filled closed shape from a real 3D curve onto a UV image.
     Returns (ok, message).
     '''
     if mode == 'SHAPE':
@@ -1763,183 +1886,305 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
         curve_obj, fallback='NEAREST_SURFACEPOINT'
     )
     polyline = _curve_to_polyline(
-        curve_obj, resolution=max(int(resolution), 32), shrinkwrap_method=method
+        curve_obj, resolution=max(resolution, 8), shrinkwrap_method=method
     )
     if len(polyline) < 2:
         return False, 'Curve has too few points to bake'
+    width_samples = max(width_samples, 2)
     cyclic = _curve_is_cyclic(curve_obj)
     # Evaluated/shrinkwrap sampling can leave a duplicate close point
     if cyclic and len(polyline) >= 3 and (polyline[0] - polyline[-1]).length < 1e-4:
         polyline = polyline[:-1]
     if len(polyline) < 2:
         return False, 'Curve has too few points to bake'
-    polyline = _decimate_points(polyline, 2048)
 
-    obj_dim = max(obj.dimensions) if obj.dimensions.length > 0 else 1.0
+    # Max search distance: generous default based on object size + path width
     if project_distance is None:
-        project_distance = max(obj_dim * 0.5, width * 4.0, 0.1)
+        dim = max(obj.dimensions) if obj.dimensions.length > 0 else 1.0
+        project_distance = max(dim * 0.5, width * 4.0, 0.1)
 
-    half_w = max(float(width), 1e-6) * 0.5
+    # Read destination pixels
+    if is_bl_newer_than(2, 83):
+        pxs = numpy.empty(shape=img_w * img_h * 4, dtype=numpy.float32)
+        image.pixels.foreach_get(pxs)
+    else:
+        pxs = numpy.array(image.pixels[:], dtype=numpy.float32)
+    pxs.shape = (img_h, img_w, 4)
 
-    # Surface under each curve sample: normals for facing, distance for the gap
-    sample_nrm = []
-    gap_found = 0.0
-    for p in polyline:
-        hit = _nearest_uv(bvh, tris, p)
-        if hit:
-            sample_nrm.append(hit[1])
-            gap_found = max(gap_found, float(hit[3]))
+    if clear:
+        pxs[:] = 0.0
+
+    # Optional path texture
+    tex_pxs = None
+    tw = th = 0
+    if path_texture and path_texture.size[0] > 0 and path_texture.size[1] > 0:
+        tw, th = path_texture.size[0], path_texture.size[1]
+        if is_bl_newer_than(2, 83):
+            tex_pxs = numpy.empty(shape=tw * th * 4, dtype=numpy.float32)
+            path_texture.pixels.foreach_get(tex_pxs)
         else:
-            sample_nrm.append(Vector((0.0, 0.0, 1.0)))
-    gap_found = min(gap_found, float(project_distance))
-    # How far the curve may hover over the surface it paints
-    gap_limit = max(gap_found * 1.6 + half_w * 0.5, half_w * 1.25, obj_dim * 0.002)
+            tex_pxs = numpy.array(path_texture.pixels[:], dtype=numpy.float32)
+        tex_pxs.shape = (th, tw, 4)
 
-    segments = _polyline_to_segments(polyline, cyclic)
-    if segments is None:
-        return False, 'Curve has too few points to bake'
-    _seg_start, seg_delta, _seg_delta2, seg_len, _seg_arc, total_len = segments
-    seg_count = seg_delta.shape[0]
+    half_w = width * 0.5
+    n_len = len(polyline)
+    # UV seam jump threshold in pixels — don't bridge / fill across UV islands
+    seam_px = max(img_w, img_h) * 0.08
 
-    nrm_pts = numpy.array([[n.x, n.y, n.z] for n in sample_nrm], dtype=numpy.float32)
-    if cyclic and nrm_pts.shape[0] >= 3:
-        seg_nrm = nrm_pts + numpy.roll(nrm_pts, -1, axis=0)
-    else:
-        seg_nrm = nrm_pts[:-1] + nrm_pts[1:]
-    nrm_lens = numpy.linalg.norm(seg_nrm, axis=1)
-    nrm_lens[nrm_lens < 1e-12] = 1.0
-    seg_nrm = (seg_nrm / nrm_lens[:, None]).astype(numpy.float32)
+    # Collect per-width-lane samples: list of (uv, u_len, v_across, strength) or None
+    lanes = [[] for _ in range(width_samples)]
+    prev_side = None
+    prev_tangent = None
 
-    verts, tri_uvs, tri_nrms = _tris_to_arrays(tris)
-    tex_pxs, tw, th = _load_texture_pixels(path_texture)
-    use_tex = tex_pxs is not None
-
-    # Only the surface around the curve can be painted. A texel is in reach when
-    # it is at most half a width sideways and at most gap_limit along its normal
-    search_r = math.sqrt(gap_limit * gap_limit + (half_w * 1.1) ** 2)
-    query_pts = _decimate_points(polyline, 512)
-    if len(query_pts) > 1:
-        spacing = max(
-            (query_pts[i + 1] - query_pts[i]).length for i in range(len(query_pts) - 1)
-        )
-    else:
-        spacing = 0.0
-    cand_idx = _tris_near_points(bvh, len(tris), query_pts, search_r + spacing * 0.5)
-    if cand_idx is None:
-        curve_np = numpy.array([[p.x, p.y, p.z] for p in polyline], dtype=numpy.float32)
-        lo = curve_np.min(axis=0) - search_r
-        hi = curve_np.max(axis=0) + search_r
-        tri_lo = verts.min(axis=1)
-        tri_hi = verts.max(axis=1)
-        cand_idx = numpy.nonzero(numpy.all((tri_hi >= lo) & (tri_lo <= hi), axis=1))[0]
-    if cand_idx.size == 0:
-        return False, 'No mesh surface near the curve (move the curve closer)'
-
-    accum = _BakeAccumulator(img_w, img_h, use_tex)
-
-    for batch in _batch_tri_indices(tri_uvs, cand_idx, img_w, img_h):
-        gathered = _gather_surface_texels(batch, verts, tri_uvs, tri_nrms, img_w, img_h)
-        if gathered is None:
+    for i in range(n_len):
+        p = polyline[i]
+        if cyclic and n_len >= 3:
+            prev_p = polyline[(i - 1) % n_len]
+            next_p = polyline[(i + 1) % n_len]
+            tangent = next_p - prev_p
+        elif i == 0:
+            tangent = (polyline[1] - polyline[0])
+        elif i == n_len - 1:
+            tangent = (polyline[-1] - polyline[-2])
+        else:
+            tangent = (polyline[i + 1] - polyline[i - 1])
+        if tangent.length < 1e-10:
+            for lane in lanes:
+                lane.append(None)
             continue
-        ys, xs, pts, nrm, world_per_px = gathered
+        tangent.normalize()
 
-        dist, arc, seg_t, seg_i, closest = _closest_on_polyline(pts, segments, search_r)
-        offset = pts - closest
-        # Split the offset into the gap along the surface normal and the sideways
-        # distance — the width is measured on the surface, not through space
-        gap = numpy.einsum('ij,ij->i', offset, nrm)
-        lateral = offset - gap[:, None] * nrm
-        lat_dist = numpy.sqrt(numpy.einsum('ij,ij->i', lateral, lateral))
-
-        keep = numpy.isfinite(dist)
-        keep &= lat_dist <= half_w + world_per_px
-        keep &= numpy.abs(gap) <= gap_limit
-        # Surface facing away from the curve may still be a valid wrap around a
-        # crease, so visibility decides it below instead of dropping it here
-        away = numpy.einsum('ij,ij->i', nrm, seg_nrm[seg_i]) <= -0.15
-        if not cyclic:
-            # Flat caps exactly at the curve ends
-            keep &= ~(
-                ((seg_i == 0) & (seg_t <= 1e-6))
-                | ((seg_i == seg_count - 1) & (seg_t >= 1.0 - 1e-6))
-            )
-        if not numpy.any(keep):
+        center = _nearest_uv(bvh, tris, p, max_dist=project_distance)
+        if not center:
+            for lane in lanes:
+                lane.append(None)
             continue
+        c_loc, c_normal, _, _ = center
 
-        ys = ys[keep]
-        xs = xs[keep]
-        pts = pts[keep]
-        nrm = nrm[keep]
-        closest = closest[keep]
-        lateral = lateral[keep]
-        lat_dist = lat_dist[keep]
-        gap = gap[keep]
-        arc = arc[keep]
-        seg_i = seg_i[keep]
-        world_per_px = world_per_px[keep]
-        away = away[keep]
+        raw_side = c_normal.cross(tangent)
+        if raw_side.length < 1e-8:
+            raw_side = tangent.cross(Vector((0, 0, 1)))
+            if raw_side.length < 1e-8:
+                raw_side = tangent.cross(Vector((0, 1, 0)))
+        if raw_side.length < 1e-8:
+            for lane in lanes:
+                lane.append(None)
+            continue
+        raw_side.normalize()
+        side = _parallel_transport_side(prev_side, prev_tangent, tangent)
+        if side is None:
+            side = raw_side
+        prev_side = side
+        prev_tangent = tangent.copy()
 
-        # Back sides and surface the curve hovers over must be visible from the
-        # curve — this is what stops a ribbon from tunneling through thin panels
-        suspect = numpy.nonzero(away | (numpy.abs(gap) > half_w * 1.5))[0]
-        if suspect.size:
-            if suspect.size > _OCCLUSION_TEST_LIMIT:
-                # Too many rays to trace: drop the back side, trust the rest
-                blocked = away[suspect]
+        u_len = i / float(max(n_len - 1, 1))
+        # Lift along normal so creases on low-poly meshes still find a surface hit
+        lift = max(half_w * 0.35, project_distance * 0.01)
+
+        for j in range(width_samples):
+            if width_samples == 1:
+                v_across = 0.0
             else:
-                blocked = _reject_occluded(bvh, closest[suspect], pts[suspect])
-            if numpy.any(blocked):
-                visible = numpy.ones(ys.shape[0], dtype=bool)
-                visible[suspect[blocked]] = False
-                ys = ys[visible]
-                xs = xs[visible]
-                nrm = nrm[visible]
-                lateral = lateral[visible]
-                lat_dist = lat_dist[visible]
-                arc = arc[visible]
-                seg_i = seg_i[visible]
-                world_per_px = world_per_px[visible]
-        if ys.shape[0] == 0:
-            continue
+                v_across = (j / float(width_samples - 1)) * 2.0 - 1.0
 
-        # Edge antialiasing is one texel wide wherever the texel happens to land
-        edge = numpy.clip(
-            (half_w - lat_dist) / numpy.maximum(world_per_px * 0.7, 1e-9) + 0.5, 0.0, 1.0
-        ).astype(numpy.float32)
-        if falloff <= 0.0:
-            alpha = edge
-        else:
-            alpha = _falloff_profile(lat_dist, half_w, falloff) * edge
+            offset = side * (v_across * half_w)
+            sample_pos = c_loc + offset + c_normal * lift
+            hit = _nearest_uv(bvh, tris, sample_pos, max_dist=project_distance)
+            if not hit:
+                hit = _nearest_uv(bvh, tris, c_loc + offset, max_dist=project_distance)
+            if not hit:
+                lanes[j].append(None)
+                continue
 
-        rgb = None
+            _, _, uv, _ = hit
+            strength = _soft_falloff(abs(v_across), power=falloff)
+            lanes[j].append((uv.copy(), u_len, v_across, strength))
+
+    # Continuous ribbon raster: coverage-max (no alpha-over sectioning) + UV quads
+    cov = numpy.zeros((img_h, img_w), dtype=numpy.float32)
+    # Optional texture accumulation (RGB weighted by coverage contribution)
+    use_tex = tex_pxs is not None
+    if use_tex:
+        acc_rgb = numpy.zeros((img_h, img_w, 3), dtype=numpy.float32)
+        acc_w = numpy.zeros((img_h, img_w), dtype=numpy.float32)
+
+    def _rgba_at(u_len, v_across):
         if use_tex:
-            tangent = seg_delta[seg_i] / seg_len[seg_i][:, None]
-            side = numpy.cross(tangent, nrm)
-            side_lens = numpy.linalg.norm(side, axis=1)
-            side_lens[side_lens < 1e-12] = 1.0
-            side /= side_lens[:, None]
-            across = numpy.einsum('ij,ij->i', lateral, side) / half_w
-            sampled = _sample_path_texture_batch(
-                tex_pxs, tw, th, arc / max(total_len, 1e-9),
-                numpy.clip(across, -1.0, 1.0),
+            rgba = _sample_path_texture(
+                tex_pxs, tw, th, u_len, v_across,
                 tile_u=tile_u, rotation_deg=rotation_deg
             )
-            alpha = alpha * sampled[:, 3]
-            rgb = sampled[:, :3]
+            return (
+                float(rgba[0]) * color[0],
+                float(rgba[1]) * color[1],
+                float(rgba[2]) * color[2],
+                float(rgba[3]) * color[3],
+            )
+        return color
 
-        accum.add(ys, xs, alpha.astype(numpy.float32), rgb)
+    def _stamp_cov(uv, strength, radius_px=1.35):
+        _splat_coverage_max(cov, img_w, img_h, uv.x, uv.y, strength, radius_px=radius_px)
 
-    if accum.count == 0:
-        return False, 'No path pixels found on the surface (move the curve closer to the mesh)'
+    def _stamp_tex(uv, u_len, v_across, strength, radius_px=1.35):
+        '''Max coverage + weighted RGB for textured ribbons.'''
+        if strength <= 1e-6:
+            return
+        if uv.x < 0.0 or uv.x > 1.0 or uv.y < 0.0 or uv.y > 1.0:
+            return
+        rgba = _rgba_at(u_len, v_across)
+        x = uv.x * (img_w - 1)
+        y = uv.y * (img_h - 1)
+        radius = max(0.75, float(radius_px))
+        r_ceil = int(math.ceil(radius)) + 1
+        x0 = max(0, int(math.floor(x)) - r_ceil)
+        x1 = min(img_w - 1, int(math.ceil(x)) + r_ceil)
+        y0 = max(0, int(math.floor(y)) - r_ceil)
+        y1 = min(img_h - 1, int(math.ceil(y)) + r_ceil)
+        inv_r = 1.0 / radius
+        cr, cg, cb, ca = rgba
+        for py in range(y0, y1 + 1):
+            for px in range(x0, x1 + 1):
+                dx = px - x
+                dy = py - y
+                d = math.sqrt(dx * dx + dy * dy) * inv_r
+                if d > 1.0:
+                    continue
+                w = (1.0 - d)
+                w = w * w * strength * ca
+                if w <= 1e-6:
+                    continue
+                if w > cov[py, px]:
+                    cov[py, px] = w
+                acc_rgb[py, px, 0] += cr * w
+                acc_rgb[py, px, 1] += cg * w
+                acc_rgb[py, px, 2] += cb * w
+                acc_w[py, px] += w
 
-    coverage, rgb_buf = accum.resolve()
-    pxs = _read_image_pixels(image, img_w, img_h)
-    filled = _composite_bake(pxs, coverage, rgb_buf, color, clear)
-    _write_image_pixels(image, pxs)
+    filled = 0
+    # 1) Fill continuous UV quads between consecutive cross-sections
+    n_frames = n_len
+    for i in range(n_frames):
+        i1 = i + 1
+        if i1 >= n_frames:
+            if cyclic and n_frames >= 3:
+                i1 = 0
+            else:
+                break
+        for j in range(width_samples - 1):
+            a = lanes[j][i]
+            b = lanes[j + 1][i]
+            c = lanes[j + 1][i1]
+            d = lanes[j][i1]
+            if a is None or b is None or c is None or d is None:
+                continue
+            uv_a, _, _, s_a = a
+            uv_b, _, _, s_b = b
+            uv_c, _, _, s_c = c
+            uv_d, _, _, s_d = d
+            # Skip UV island hops
+            if (
+                _uv_pixel_dist(uv_a, uv_b, img_w, img_h) > seam_px
+                or _uv_pixel_dist(uv_b, uv_c, img_w, img_h) > seam_px
+                or _uv_pixel_dist(uv_c, uv_d, img_w, img_h) > seam_px
+                or _uv_pixel_dist(uv_d, uv_a, img_w, img_h) > seam_px
+                or _uv_pixel_dist(uv_a, uv_d, img_w, img_h) > seam_px
+                or _uv_pixel_dist(uv_b, uv_c, img_w, img_h) > seam_px
+            ):
+                continue
+            filled += _fill_uv_quad_coverage(
+                cov, img_w, img_h,
+                uv_a, s_a, uv_b, s_b, uv_c, s_c, uv_d, s_d,
+            )
+            if use_tex:
+                # Seed texture weights at corners (quad fill is coverage-only)
+                _stamp_tex(uv_a, a[1], a[2], s_a, radius_px=1.0)
+                _stamp_tex(uv_b, b[1], b[2], s_b, radius_px=1.0)
+                _stamp_tex(uv_c, c[1], c[2], s_c, radius_px=1.0)
+                _stamp_tex(uv_d, d[1], d[2], s_d, radius_px=1.0)
 
-    return True, 'Baked path ribbon (%d pixels) [%s]' % (
-        filled, 'Project' if method == 'PROJECT' else 'Nearest'
-    )
+    # 2) Dense coverage stamps along each lane (antialias / fill tiny gaps)
+    for lane in lanes:
+        for i, sample in enumerate(lane):
+            if sample is None:
+                continue
+            uv, u_len, v_across, strength = sample
+            if use_tex:
+                _stamp_tex(uv, u_len, v_across, strength, radius_px=1.25)
+            else:
+                _stamp_cov(uv, strength, radius_px=1.25)
+            filled += 1
+            if not fill_gaps:
+                continue
+            # Bridge to next valid sample
+            nxt = None
+            if i + 1 < len(lane):
+                nxt = lane[i + 1]
+            elif cyclic and len(lane) >= 3:
+                nxt = lane[0]
+            if nxt is None:
+                continue
+            uv2, u_len2, v_across2, strength2 = nxt
+            dist_px = _uv_pixel_dist(uv, uv2, img_w, img_h)
+            if dist_px < 0.35 or dist_px > seam_px:
+                continue
+            steps = max(1, int(math.ceil(dist_px / 0.4)))
+            for s in range(1, steps):
+                t = s / float(steps)
+                uv_i = uv.lerp(uv2, t)
+                u_i = u_len * (1.0 - t) + u_len2 * t
+                v_i = v_across * (1.0 - t) + v_across2 * t
+                str_i = strength * (1.0 - t) + strength2 * t
+                if use_tex:
+                    _stamp_tex(uv_i, u_i, v_i, str_i, radius_px=1.1)
+                else:
+                    _stamp_cov(uv_i, str_i, radius_px=1.1)
+                filled += 1
+
+    if filled == 0 or float(numpy.max(cov)) <= 1e-6:
+        return False, 'No path samples projected onto the mesh (move the curve closer to the surface)'
+
+    # Composite coverage into image — uniform opacity, no stamp banding
+    cr, cg, cb, ca = [float(c) for c in color]
+    src_a = numpy.clip(cov * ca, 0.0, 1.0).astype(numpy.float32)
+    m = src_a > 1e-6
+
+    if use_tex:
+        safe = numpy.maximum(acc_w, 1e-8)[:, :, None]
+        rgb = (acc_rgb / safe).astype(numpy.float32)
+        has = acc_w > 1e-6
+        out_r = numpy.where(has, rgb[:, :, 0], cr).astype(numpy.float32)
+        out_g = numpy.where(has, rgb[:, :, 1], cg).astype(numpy.float32)
+        out_b = numpy.where(has, rgb[:, :, 2], cb).astype(numpy.float32)
+    else:
+        out_r = numpy.full((img_h, img_w), cr, dtype=numpy.float32)
+        out_g = numpy.full((img_h, img_w), cg, dtype=numpy.float32)
+        out_b = numpy.full((img_h, img_w), cb, dtype=numpy.float32)
+
+    if clear:
+        pxs[:, :, 0] = numpy.where(m, out_r, 0.0)
+        pxs[:, :, 1] = numpy.where(m, out_g, 0.0)
+        pxs[:, :, 2] = numpy.where(m, out_b, 0.0)
+        pxs[:, :, 3] = numpy.where(m, src_a, 0.0)
+    else:
+        dst_a = pxs[:, :, 3]
+        out_a = src_a + dst_a * (1.0 - src_a)
+        safe_a = numpy.maximum(out_a, 1e-8)
+        for ch, src in enumerate((out_r, out_g, out_b)):
+            pxs[:, :, ch] = numpy.where(
+                m,
+                (src * src_a + pxs[:, :, ch] * dst_a * (1.0 - src_a)) / safe_a,
+                pxs[:, :, ch],
+            )
+        pxs[:, :, 3] = numpy.where(m, numpy.minimum(out_a, 1.0), dst_a)
+
+    flat = pxs.ravel()
+    if is_bl_newer_than(2, 83):
+        image.pixels.foreach_set(flat)
+    else:
+        image.pixels = flat.tolist()
+    image.update()
+
+    return True, 'Baked path ribbon (%d samples, coverage fill)' % filled
 
 def _poll_curve_object(self, obj):
     return obj and obj.type == 'CURVE'
@@ -2003,14 +2248,13 @@ class BaseBakePath():
 
     path_resolution : IntProperty(
         name = 'Path Resolution',
-        description = 'How finely the curve itself is sampled — higher follows tight curvature more closely',
+        description = 'Number of samples along the curve length',
         default = 512, min = 8, max = 4096
     )
 
-    # Kept so older scenes keep loading; the bake no longer samples across width
     path_width_samples : IntProperty(
         name = 'Width Samples',
-        description = 'Unused — ribbon width is now measured exactly',
+        description = 'Number of samples across the ribbon width',
         default = 48, min = 2, max = 256
     )
 
@@ -2642,6 +2886,7 @@ def draw_path_bake_ui(layout, context, layer):
         col.prop(layer, 'path_falloff', text='Feather Falloff')
     else:
         col.prop(layer, 'path_width')
+        col.prop(layer, 'path_width_samples')
         col.prop(layer, 'path_falloff')
     col.prop(layer, 'path_color')
     if is_bl_newer_than(2, 79):
