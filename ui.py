@@ -1841,6 +1841,15 @@ def draw_layer_vector(context, layout, layer, layer_tree, source, image, vcol, i
                 splits.label(text='Decal Distance:')
                 draw_input_prop(splits, layer, 'decal_distance_value', layer=layer)
 
+                rrow = boxcol.row(align=True)
+                rrow.label(text='', icon='BLANK1')
+                splits = split_layout(rrow, 0.5, align=True)
+                splits.label(text='Mirror Axis')
+                axes = splits.row(align=True)
+                axes.prop(layer, 'decal_mirror_x', text='X', toggle=True)
+                axes.prop(layer, 'decal_mirror_y', text='Y', toggle=True)
+                axes.prop(layer, 'decal_mirror_z', text='Z', toggle=True)
+
                 if texcoord and texcoord.object:
 
                     rrow = boxcol.row(align=True)
@@ -3218,6 +3227,13 @@ def draw_layer_masks(context, layout, layer, specific_mask=None):
                     splits = split_layout(boxcol, 0.5, align=True)
                     splits.label(text='Decal Distance:')
                     draw_input_prop(splits, mask, 'decal_distance_value', layer=layer)
+
+                    splits = split_layout(boxcol, 0.5, align=True)
+                    splits.label(text='Mirror Axis')
+                    axes = splits.row(align=True)
+                    axes.prop(mask, 'decal_mirror_x', text='X', toggle=True)
+                    axes.prop(mask, 'decal_mirror_y', text='Y', toggle=True)
+                    axes.prop(mask, 'decal_mirror_z', text='Z', toggle=True)
 
                     if texcoord and texcoord.object:
                         rrow = boxcol.row(align=True)
