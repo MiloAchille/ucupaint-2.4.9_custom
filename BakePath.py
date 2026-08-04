@@ -374,14 +374,13 @@ def duplicate_path_curve_for_layer(layer, duplicated_curves=None):
 
         # Keep shrinkwrap targeting the same mesh (parent / existing target)
         if getattr(layer, 'path_enable_shrinkwrap', True):
-            method = _layer_shrinkwrap_method(layer)
             target = new_curve.parent
             if target and target.type == 'MESH':
-                ensure_path_shrinkwrap(new_curve, target, method=method)
+                _apply_layer_shrinkwrap(layer, new_curve, target)
             else:
                 mod = get_path_shrinkwrap_modifier(new_curve)
                 if mod and mod.target:
-                    ensure_path_shrinkwrap(new_curve, mod.target, method=method)
+                    _apply_layer_shrinkwrap(layer, new_curve, mod.target)
 
     set_path_curve_object(layer, new_curve)
     return new_curve
@@ -398,8 +397,9 @@ def get_path_shrinkwrap_modifier(curve_obj):
             return mod
     return None
 
-def configure_path_shrinkwrap(mod, target_obj, method='NEAREST_SURFACEPOINT'):
-    '''Apply path shrinkwrap settings (Nearest Surface Point or Project +/-).'''
+def configure_path_shrinkwrap(mod, target_obj, method='NEAREST_SURFACEPOINT',
+                              project_axes=(False, False, False)):
+    '''Apply path shrinkwrap settings (Nearest, or Project along chosen axes).'''
     mod.target = target_obj
     if method == 'PROJECT':
         mod.wrap_method = 'PROJECT'
@@ -407,13 +407,13 @@ def configure_path_shrinkwrap(mod, target_obj, method='NEAREST_SURFACEPOINT'):
             mod.use_negative_direction = True
         if hasattr(mod, 'use_positive_direction'):
             mod.use_positive_direction = True
-        # No project axes — match Blender Project setup with only +/- directions
+        ax, ay, az = project_axes
         if hasattr(mod, 'use_project_x'):
-            mod.use_project_x = False
+            mod.use_project_x = bool(ax)
         if hasattr(mod, 'use_project_y'):
-            mod.use_project_y = False
+            mod.use_project_y = bool(ay)
         if hasattr(mod, 'use_project_z'):
-            mod.use_project_z = False
+            mod.use_project_z = bool(az)
     else:
         mod.wrap_method = 'NEAREST_SURFACEPOINT'
     if hasattr(mod, 'wrap_mode'):
@@ -426,7 +426,8 @@ def configure_path_shrinkwrap(mod, target_obj, method='NEAREST_SURFACEPOINT'):
     if hasattr(mod, 'show_on_cage'):
         mod.show_on_cage = True
 
-def ensure_path_shrinkwrap(curve_obj, target_obj=None, method='NEAREST_SURFACEPOINT'):
+def ensure_path_shrinkwrap(curve_obj, target_obj=None, method='NEAREST_SURFACEPOINT',
+                           project_axes=(False, False, False)):
     '''Add or update Shrinkwrap on the path curve, targeting the parent mesh.'''
     if not curve_obj or curve_obj.type != 'CURVE':
         return None
@@ -440,7 +441,7 @@ def ensure_path_shrinkwrap(curve_obj, target_obj=None, method='NEAREST_SURFACEPO
         mod = curve_obj.modifiers.new(PATH_SHRINKWRAP_NAME, 'SHRINKWRAP')
     elif mod.name != PATH_SHRINKWRAP_NAME:
         mod.name = PATH_SHRINKWRAP_NAME
-    configure_path_shrinkwrap(mod, target_obj, method=method)
+    configure_path_shrinkwrap(mod, target_obj, method=method, project_axes=project_axes)
     return mod
 
 def remove_path_shrinkwrap(curve_obj):
@@ -454,6 +455,24 @@ def remove_path_shrinkwrap(curve_obj):
 def _layer_shrinkwrap_method(layer):
     return getattr(layer, 'path_shrinkwrap_method', 'NEAREST_SURFACEPOINT') or 'NEAREST_SURFACEPOINT'
 
+def _layer_project_axes(layer):
+    '''(x, y, z) project-axis flags from a path/shape layer.'''
+    return (
+        bool(getattr(layer, 'path_project_x', False)),
+        bool(getattr(layer, 'path_project_y', False)),
+        bool(getattr(layer, 'path_project_z', False)),
+    )
+
+def _apply_layer_shrinkwrap(layer, curve_obj, target_obj):
+    '''Push the layer's shrinkwrap method + axes onto the curve modifier.'''
+    if not curve_obj or not target_obj:
+        return None
+    return ensure_path_shrinkwrap(
+        curve_obj, target_obj,
+        method=_layer_shrinkwrap_method(layer),
+        project_axes=_layer_project_axes(layer),
+    )
+
 def update_path_enable_shrinkwrap(self, context):
     curve_obj = get_path_curve_object(self)
     if not curve_obj:
@@ -461,7 +480,7 @@ def update_path_enable_shrinkwrap(self, context):
     if self.path_enable_shrinkwrap:
         target = curve_obj.parent if curve_obj.parent else context.object
         if target and target.type == 'MESH':
-            ensure_path_shrinkwrap(curve_obj, target, method=_layer_shrinkwrap_method(self))
+            _apply_layer_shrinkwrap(self, curve_obj, target)
     else:
         remove_path_shrinkwrap(curve_obj)
 
@@ -474,10 +493,24 @@ def update_path_shrinkwrap_method(self, context):
         return
     target = curve_obj.parent if curve_obj.parent else getattr(context, 'object', None)
     if target and target.type == 'MESH':
-        ensure_path_shrinkwrap(curve_obj, target, method=_layer_shrinkwrap_method(self))
+        _apply_layer_shrinkwrap(self, curve_obj, target)
+
+def update_path_project_axis(self, context):
+    '''Re-apply Project axes on the curve shrinkwrap when X/Y/Z toggles change.'''
+    if not getattr(self, 'path_enable_shrinkwrap', False):
+        return
+    if _layer_shrinkwrap_method(self) != 'PROJECT':
+        return
+    curve_obj = get_path_curve_object(self)
+    if not curve_obj:
+        return
+    target = curve_obj.parent if curve_obj.parent else getattr(context, 'object', None)
+    if target and target.type == 'MESH':
+        _apply_layer_shrinkwrap(self, curve_obj, target)
 
 def create_path_curve(target_obj, name='Path', use_shrinkwrap=True, cyclic=False,
-                      shrinkwrap_method='NEAREST_SURFACEPOINT'):
+                      shrinkwrap_method='NEAREST_SURFACEPOINT',
+                      project_axes=(False, False, False)):
     scene = bpy.context.scene
     curve_name = get_unique_name(name, bpy.data.objects)
     curve_data = bpy.data.curves.new(curve_name, type='CURVE')
@@ -562,7 +595,9 @@ def create_path_curve(target_obj, name='Path', use_shrinkwrap=True, cyclic=False
     curve_obj.matrix_parent_inverse = target_obj.matrix_world.inverted()
 
     if use_shrinkwrap:
-        ensure_path_shrinkwrap(curve_obj, target_obj, method=shrinkwrap_method)
+        ensure_path_shrinkwrap(
+            curve_obj, target_obj, method=shrinkwrap_method, project_axes=project_axes
+        )
 
     return curve_obj
 
@@ -1784,19 +1819,125 @@ def _fit_polyline_plane(polyline):
     else:
         normal.normalize()
 
-    axis_u = normal.cross(Vector((0.0, 0.0, 1.0)))
+    return _plane_frame_from_center_normal(center, normal)
+
+def _plane_frame_from_center_normal(center, normal):
+    '''Orthonormal (center, axis_u, axis_v, normal) for a projection plane.'''
+    n = Vector(normal)
+    if n.length < 1e-8:
+        n = Vector((0.0, 0.0, 1.0))
+    else:
+        n.normalize()
+    axis_u = n.cross(Vector((0.0, 0.0, 1.0)))
     if axis_u.length < 1e-6:
-        axis_u = normal.cross(Vector((0.0, 1.0, 0.0)))
+        axis_u = n.cross(Vector((0.0, 1.0, 0.0)))
     if axis_u.length < 1e-8:
         axis_u = Vector((1.0, 0.0, 0.0))
     else:
         axis_u.normalize()
-    axis_v = normal.cross(axis_u)
+    axis_v = n.cross(axis_u)
     if axis_v.length < 1e-8:
         axis_v = Vector((0.0, 1.0, 0.0))
     else:
         axis_v.normalize()
-    return center, axis_u, axis_v, normal
+    return center, axis_u, axis_v, n
+
+def _world_project_normal(curve_obj, project_axes, fallback_obj=None):
+    '''
+    World-space bake/shrinkwrap normal from enabled X/Y/Z flags.
+    Axes are taken in the curve object's local space (same as Shrinkwrap Project).
+    Returns None when no axis is enabled (caller should auto-fit).
+    '''
+    ax, ay, az = project_axes
+    local = Vector((1.0 if ax else 0.0, 1.0 if ay else 0.0, 1.0 if az else 0.0))
+    if local.length < 1e-8:
+        return None
+    space = curve_obj if (curve_obj and curve_obj.type == 'CURVE') else fallback_obj
+    if space is not None:
+        normal = space.matrix_world.to_3x3() @ local
+    else:
+        normal = local
+    if normal.length < 1e-8:
+        return None
+    normal.normalize()
+    return normal
+
+def _get_viewport_view_direction(context=None):
+    '''
+    World-space direction the active 3D Viewport is looking (into the screen).
+    Used when baking with Project Axis → View.
+    '''
+    ctx = context if context is not None else bpy.context
+    rv3d = getattr(ctx, 'region_data', None)
+    if rv3d is not None:
+        direction = rv3d.view_rotation @ Vector((0.0, 0.0, -1.0))
+        if direction.length > 1e-8:
+            direction.normalize()
+            return direction
+
+    screen = getattr(ctx, 'screen', None)
+    if screen is None:
+        window = getattr(ctx, 'window', None)
+        screen = getattr(window, 'screen', None) if window else None
+    if screen is None:
+        wm = getattr(ctx, 'window_manager', None)
+        if wm and getattr(wm, 'windows', None):
+            for window in wm.windows:
+                if window.screen:
+                    screen = window.screen
+                    break
+    if screen is None:
+        return None
+
+    for area in screen.areas:
+        if area.type != 'VIEW_3D':
+            continue
+        space = area.spaces.active if hasattr(area.spaces, 'active') else None
+        if space is None and len(area.spaces) > 0:
+            space = area.spaces[0]
+        rv3d = getattr(space, 'region_3d', None) if space else None
+        if rv3d is None:
+            continue
+        direction = rv3d.view_rotation @ Vector((0.0, 0.0, -1.0))
+        if direction.length > 1e-8:
+            direction.normalize()
+            return direction
+    return None
+
+def _project_polyline_along_direction(points, bvh, direction, max_dist):
+    '''
+    Project each point onto the mesh along +/- direction (Shrinkwrap Project style).
+    Picks the hit closest to the original point. Misses keep the original.
+    '''
+    if not points or bvh is None:
+        return list(points) if points else []
+    d = Vector(direction)
+    if d.length < 1e-8:
+        return [Vector(p) for p in points]
+    d.normalize()
+    reach = max(float(max_dist), 1e-4)
+    out = []
+    for p in points:
+        p = Vector(p)
+        best = None
+        best_gap = None
+        for sign in (1.0, -1.0):
+            ray = d * sign
+            # Start behind the point so both sides of a thin shell can hit
+            origin = p - ray * reach
+            try:
+                hit = bvh.ray_cast(origin, ray, reach * 2.0)
+            except Exception:
+                hit = None
+            if not hit or hit[0] is None:
+                continue
+            loc = Vector(hit[0])
+            gap = (loc - p).length
+            if best is None or gap < best_gap:
+                best = loc
+                best_gap = gap
+        out.append(best if best is not None else p)
+    return out
 
 def _decimate_points(points, max_points):
     '''Uniformly thin a point list — keeps the shape, caps the field cost.'''
@@ -1892,13 +2033,14 @@ def bake_shape_to_image(obj, image, curve_obj, uv_name, resolution,
                         color=(1, 1, 1, 1), falloff=1.0, clear=True,
                         path_texture=None, tile_u=1.0, rotation_deg=0.0,
                         feather_px=2.0, project_distance=None,
-                        shrinkwrap_method=None):
+                        shrinkwrap_method=None, project_axes=(False, False, False),
+                        project_normal=None):
     '''
     Fill a closed (cyclic) curve onto the UV image as a solid vector shape.
 
-    The outline is fitted to its own plane and every surface texel under that
-    plane is tested against the real outline, so the fill matches the curve
-    exactly — including the parts that overhang the mesh silhouette.
+    The outline is projected onto a plane and every surface texel under that
+    plane is tested against the real outline. Enable path_project_x/y/z or
+    path_project_view to force that plane's normal; otherwise the plane is fitted.
     Returns (ok, message).
 
     shrinkwrap_method: 'NEAREST_SURFACEPOINT' | 'PROJECT' | None (read from modifier)
@@ -1946,6 +2088,20 @@ def bake_shape_to_image(obj, image, curve_obj, uv_name, resolution,
     if not loops:
         return False, 'Closed shape needs at least 3 points'
 
+    forced_normal = None
+    proj_tag = ''
+    if project_normal is not None:
+        forced_normal = Vector(project_normal)
+        if forced_normal.length > 1e-8:
+            forced_normal.normalize()
+            proj_tag = ' view'
+        else:
+            forced_normal = None
+    if forced_normal is None:
+        forced_normal = _world_project_normal(curve_obj, project_axes, fallback_obj=obj)
+        if forced_normal is not None:
+            proj_tag = ' axis'
+
     verts, tri_uvs, tri_nrms = _tris_to_arrays(tris)
     tex_pxs, tw, th = _load_texture_pixels(path_texture)
     use_tex = tex_pxs is not None
@@ -1963,7 +2119,16 @@ def bake_shape_to_image(obj, image, curve_obj, uv_name, resolution,
         if len(outline) < 3:
             continue
 
-        center, axis_u, axis_v, plane_n = _fit_polyline_plane(outline)
+        center = Vector((0.0, 0.0, 0.0))
+        for p in outline:
+            center += p
+        center /= float(len(outline))
+        if forced_normal is not None:
+            center, axis_u, axis_v, plane_n = _plane_frame_from_center_normal(
+                center, forced_normal
+            )
+        else:
+            center, axis_u, axis_v, plane_n = _fit_polyline_plane(outline)
 
         # Face the outline plane the same way as the surface it sits on
         surface_n = Vector((0.0, 0.0, 0.0))
@@ -2117,9 +2282,9 @@ def bake_shape_to_image(obj, image, curve_obj, uv_name, resolution,
     filled = _composite_bake(pxs, coverage, rgb_buf, color, clear)
     _write_image_pixels(image, pxs)
 
-    msg = 'Filled shape (%d loop%s, %d / %d pixels) [%s]' % (
+    msg = 'Filled shape (%d loop%s, %d / %d pixels) [%s%s]' % (
         loops_baked, 's' if loops_baked != 1 else '', filled, img_w * img_h,
-        'Project' if use_project else 'Nearest'
+        'Project' if use_project else 'Nearest', proj_tag
     )
     if loops_baked < len(loops):
         msg += ' — %d loop(s) found no surface' % (len(loops) - loops_baked)
@@ -2129,7 +2294,8 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
                        color=(1, 1, 1, 1), falloff=1.0, clear=True,
                        path_texture=None, tile_u=1.0, rotation_deg=0.0,
                        project_distance=None, fill_gaps=True, mode='RIBBON',
-                       feather_px=2.0, shrinkwrap_method=None):
+                       feather_px=2.0, shrinkwrap_method=None,
+                       project_axes=(False, False, False), project_normal=None):
     '''
     Bake a ribbon (or a filled closed shape) from a real 3D curve onto a UV image.
 
@@ -2145,7 +2311,8 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
             color=color, falloff=falloff, clear=clear,
             path_texture=path_texture, tile_u=tile_u, rotation_deg=rotation_deg,
             feather_px=feather_px, project_distance=project_distance,
-            shrinkwrap_method=shrinkwrap_method
+            shrinkwrap_method=shrinkwrap_method, project_axes=project_axes,
+            project_normal=project_normal
         )
 
     if not obj or obj.type != 'MESH':
@@ -2166,12 +2333,39 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
     method = shrinkwrap_method if shrinkwrap_method is not None else _curve_shrinkwrap_method(
         curve_obj, fallback='NEAREST_SURFACEPOINT'
     )
+    obj_dim = max(obj.dimensions) if obj.dimensions.length > 0 else 1.0
+    half_w = max(float(width), 1e-6) * 0.5
+    # How far the curve may hover over the surface and still paint it
+    if project_distance is None:
+        project_distance = max(half_w * 8.0, obj_dim * 0.08)
+    hover_ceiling = max(float(project_distance), half_w * 2.0)
+
+    view_dir = None
+    if project_normal is not None:
+        view_dir = Vector(project_normal)
+        if view_dir.length > 1e-8:
+            view_dir.normalize()
+        else:
+            view_dir = None
+
     # One polyline per spline — never bridge gaps between distinct curves
-    loop_entries = _curve_to_polylines(
-        curve_obj, resolution=max(int(resolution), 32), shrinkwrap_method=method
-    )
+    if view_dir is not None:
+        # View bake: keep authored silhouette, then raycast onto the mesh
+        loop_entries = _sample_bezier_math_loops(curve_obj, max(int(resolution), 32))
+        if not loop_entries:
+            loop_entries = _curve_to_polylines(
+                curve_obj, resolution=max(int(resolution), 32), shrinkwrap_method='PROJECT'
+            )
+    else:
+        loop_entries = _curve_to_polylines(
+            curve_obj, resolution=max(int(resolution), 32), shrinkwrap_method=method
+        )
     raw_loops = []
     for polyline, cyclic in loop_entries:
+        if view_dir is not None:
+            polyline = _project_polyline_along_direction(
+                polyline, bvh, view_dir, max(hover_ceiling * 4.0, obj_dim)
+            )
         if cyclic and len(polyline) >= 3 and (polyline[0] - polyline[-1]).length < 1e-4:
             polyline = polyline[:-1]
         if len(polyline) >= 2:
@@ -2179,8 +2373,6 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
     if not raw_loops:
         return False, 'Curve has too few points to bake'
 
-    obj_dim = max(obj.dimensions) if obj.dimensions.length > 0 else 1.0
-    half_w = max(float(width), 1e-6) * 0.5
     # Thin dense samples — closest-point cost scales with segment count
     prepared = [
         (_decimate_polyline_for_width(polyline, half_w), cyclic)
@@ -2189,11 +2381,6 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
     prepared = [(pl, cy) for pl, cy in prepared if len(pl) >= 2]
     if not prepared:
         return False, 'Curve has too few points to bake'
-
-    # How far the curve may hover over the surface and still paint it
-    if project_distance is None:
-        project_distance = max(half_w * 8.0, obj_dim * 0.08)
-    hover_ceiling = max(float(project_distance), half_w * 2.0)
 
     verts, tri_uvs, tri_nrms = _tris_to_arrays(tris)
     tex_pxs, tw, th = _load_texture_pixels(path_texture)
@@ -2366,8 +2553,11 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
     filled = _composite_bake(pxs, coverage, rgb_buf, color, clear)
     _write_image_pixels(image, pxs)
 
+    method_tag = 'View' if view_dir is not None else (
+        'Project' if method == 'PROJECT' else 'Nearest'
+    )
     return True, 'Baked path ribbon (%d pixels, %d spline(s)) [%s]' % (
-        filled, splines_baked, 'Project' if method == 'PROJECT' else 'Nearest'
+        filled, splines_baked, method_tag
     )
 
 
@@ -2406,10 +2596,34 @@ class BaseBakePath():
         description = 'How the path curve sticks to the mesh',
         items = (
             ('NEAREST_SURFACEPOINT', 'Nearest', 'Nearest Surface Point (snap to closest mesh location)'),
-            ('PROJECT', 'Project', 'Shrinkwrap Project (+/- directions, no axis)'),
+            ('PROJECT', 'Project', 'Shrinkwrap Project along +/- of the chosen axes'),
         ),
         default = 'NEAREST_SURFACEPOINT',
         update = update_path_shrinkwrap_method
+    )
+
+    path_project_x : BoolProperty(
+        name = 'X',
+        description = "Project along the curve object's X axis (Shrinkwrap Project + shape bake plane)",
+        default = False,
+        update = update_path_project_axis
+    )
+    path_project_y : BoolProperty(
+        name = 'Y',
+        description = "Project along the curve object's Y axis (Shrinkwrap Project + shape bake plane)",
+        default = False,
+        update = update_path_project_axis
+    )
+    path_project_z : BoolProperty(
+        name = 'Z',
+        description = "Project along the curve object's Z axis (Shrinkwrap Project + shape bake plane)",
+        default = False,
+        update = update_path_project_axis
+    )
+    path_project_view : BoolProperty(
+        name = 'View',
+        description = 'Bake using the current 3D Viewport looking direction (ribbons project onto the mesh along the view; shapes use it as the plane normal). Captured at bake time',
+        default = False
     )
 
     if is_bl_newer_than(2, 79):
@@ -2624,7 +2838,7 @@ class YNewPathLayer(bpy.types.Operator):
         layer.path_shrinkwrap_method = 'NEAREST_SURFACEPOINT'
         set_path_curve_object(layer, curve_obj)
         layer.path_width = self.path_width
-        ensure_path_shrinkwrap(curve_obj, obj, method=layer.path_shrinkwrap_method)
+        _apply_layer_shrinkwrap(layer, curve_obj, obj)
         if is_shape:
             ensure_curve_cyclic(curve_obj, True)
 
@@ -2653,7 +2867,8 @@ class YNewPathLayer(bpy.types.Operator):
             clear=True,
             mode=layer.path_mode,
             feather_px=layer.path_shape_feather,
-            shrinkwrap_method=_layer_shrinkwrap_method(layer)
+            shrinkwrap_method=_layer_shrinkwrap_method(layer),
+            project_axes=_layer_project_axes(layer),
         )
         kind = 'Shape' if is_shape else 'Path'
         if not ok:
@@ -2697,7 +2912,7 @@ class YBakePathToLayer(bpy.types.Operator):
             return {'CANCELLED'}
 
         T = time.time()
-        ok, msg = bake_layer_path(obj, layer)
+        ok, msg = bake_layer_path(obj, layer, context=context)
 
         if not ok:
             self.report({'ERROR'}, msg)
@@ -2709,7 +2924,7 @@ class YBakePathToLayer(bpy.types.Operator):
         self.report({'INFO'}, msg + ' ({:0.0f} ms)'.format((time.time() - T) * 1000))
         return {'FINISHED'}
 
-def bake_layer_path(obj, layer):
+def bake_layer_path(obj, layer, context=None):
     '''Bake one path/shape layer. Returns (ok, message).'''
     curve_obj = get_path_curve_object(layer)
     if not curve_obj:
@@ -2727,8 +2942,15 @@ def bake_layer_path(obj, layer):
         path_tex = getattr(layer, 'path_texture', None)
 
     method = _layer_shrinkwrap_method(layer)
+    axes = _layer_project_axes(layer)
+    project_normal = None
+    if getattr(layer, 'path_project_view', False):
+        project_normal = _get_viewport_view_direction(context)
+        if project_normal is None:
+            return False, "No 3D Viewport found — open a 3D View or turn off Project Axis 'View'"
+
     if getattr(layer, 'path_enable_shrinkwrap', True):
-        ensure_path_shrinkwrap(curve_obj, obj, method=method)
+        _apply_layer_shrinkwrap(layer, curve_obj, obj)
 
     ok, msg = bake_path_to_image(
         obj, image, curve_obj, layer.uv_name,
@@ -2744,6 +2966,8 @@ def bake_layer_path(obj, layer):
         mode=layer.path_mode,
         feather_px=layer.path_shape_feather,
         shrinkwrap_method=method,
+        project_axes=axes,
+        project_normal=project_normal,
     )
     if ok:
         image.update()
@@ -2794,7 +3018,7 @@ class YBakeAllPaths(bpy.types.Operator):
         ok_count = 0
         fail_msgs = []
         for layer in layers:
-            ok, msg = bake_layer_path(obj, layer)
+            ok, msg = bake_layer_path(obj, layer, context=context)
             if ok:
                 ok_count += 1
                 print('INFO: Baked path layer', layer.name + ':', msg)
@@ -2917,7 +3141,7 @@ class YResizePathBakeImage(bpy.types.Operator):
             if not obj:
                 self.report({'WARNING'}, msg + ' (rebake skipped: no mesh)')
                 return {'FINISHED'}
-            ok, bake_msg = bake_layer_path(obj, layer)
+            ok, bake_msg = bake_layer_path(obj, layer, context=context)
             if ok:
                 self.report({'INFO'}, msg + ' and rebaked')
             else:
@@ -2997,12 +3221,13 @@ class YCreatePathCurveForLayer(bpy.types.Operator):
             name=layer.name + (' Shape' if is_shape else ' Curve'),
             use_shrinkwrap=layer.path_enable_shrinkwrap,
             cyclic=is_shape,
-            shrinkwrap_method=_layer_shrinkwrap_method(layer)
+            shrinkwrap_method=_layer_shrinkwrap_method(layer),
+            project_axes=_layer_project_axes(layer),
         )
         layer.enable_path_bake = True
         set_path_curve_object(layer, curve_obj)
         if layer.path_enable_shrinkwrap:
-            ensure_path_shrinkwrap(curve_obj, obj, method=_layer_shrinkwrap_method(layer))
+            _apply_layer_shrinkwrap(layer, curve_obj, obj)
         if is_shape:
             ensure_curve_cyclic(curve_obj, True)
 
@@ -3053,6 +3278,20 @@ def draw_path_bake_ui(layout, context, layer):
     method_row = sw.row(align=True)
     method_row.enabled = layer.path_enable_shrinkwrap
     method_row.prop(layer, 'path_shrinkwrap_method', expand=True)
+
+    axis_row = col.row(align=True)
+    axis_row.label(text='Project Axis')
+    # X/Y/Z: Project shrinkwrap + shape plane. View: bake-time for ribbon and shape.
+    axes_on = (
+        (layer.path_enable_shrinkwrap and layer.path_shrinkwrap_method == 'PROJECT')
+        or layer.path_mode == 'SHAPE'
+    )
+    axes = axis_row.row(align=True)
+    axes.enabled = axes_on
+    axes.prop(layer, 'path_project_x', text='X', toggle=True)
+    axes.prop(layer, 'path_project_y', text='Y', toggle=True)
+    axes.prop(layer, 'path_project_z', text='Z', toggle=True)
+    axis_row.prop(layer, 'path_project_view', text='View', toggle=True)
 
     col.separator()
     # Bake image resolution (Layer Source Info is read-only for FILE images)
