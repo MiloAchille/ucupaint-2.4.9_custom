@@ -1345,69 +1345,248 @@ def _polyline_to_segments(points, cyclic):
     ]).astype(numpy.float32)
     return start, delta, delta2, length, arc_start, float(length.sum())
 
+def _sample_surface_gap_normals(bvh, tris, polyline, far_away, max_samples=256):
+    '''
+    Surface normal + gap under each curve sample.
+    Dense polylines are thinned first so BVH queries stay cheap; results are
+    resampled back to the full sample count.
+    '''
+    count = len(polyline)
+    if count == 0:
+        return (
+            numpy.zeros((0, 3), dtype=numpy.float32),
+            numpy.zeros(0, dtype=numpy.float32),
+        )
+    # Query a capped subset, then interpolate along the polyline index
+    query = _decimate_points(polyline, max_samples)
+    q_n = len(query)
+    q_nrm = numpy.empty((q_n, 3), dtype=numpy.float32)
+    q_gap = numpy.empty(q_n, dtype=numpy.float32)
+    for i, p in enumerate(query):
+        hit = _nearest_uv(bvh, tris, p)
+        if hit:
+            n = hit[1]
+            q_nrm[i] = (n.x, n.y, n.z)
+            q_gap[i] = float(hit[3])
+        else:
+            q_nrm[i] = (0.0, 0.0, 1.0)
+            q_gap[i] = far_away
+    if q_n == count:
+        return q_nrm, q_gap
+    # Map full indices onto the decimated query
+    src = numpy.linspace(0.0, q_n - 1, count, dtype=numpy.float32)
+    i0 = numpy.floor(src).astype(numpy.int32)
+    i1 = numpy.minimum(i0 + 1, q_n - 1)
+    t = (src - i0.astype(numpy.float32))[:, None]
+    nrm = q_nrm[i0] * (1.0 - t) + q_nrm[i1] * t
+    gap = q_gap[i0] * (1.0 - src + i0.astype(numpy.float32)) + q_gap[i1] * (src - i0.astype(numpy.float32))
+    return nrm.astype(numpy.float32), gap.astype(numpy.float32)
+
+def _build_one_path_spline_bundle(polyline, cyclic, bvh, tris, far_away):
+    '''Frame + segment arrays for a single spline.'''
+    nrm_pts, gap_pts = _sample_surface_gap_normals(bvh, tris, polyline, far_away)
+    segments = _polyline_to_segments(polyline, cyclic)
+    if segments is None:
+        return None
+    start, delta, delta2, seg_len, arc_start, total_len = segments
+    seg_count = delta.shape[0]
+    nrm_pts = _smooth_rows(nrm_pts, 2, cyclic)
+    if cyclic and nrm_pts.shape[0] >= 3:
+        seg_nrm = nrm_pts + numpy.roll(nrm_pts, -1, axis=0)
+        seg_gap = numpy.maximum(gap_pts, numpy.roll(gap_pts, -1))
+    else:
+        seg_nrm = nrm_pts[:-1] + nrm_pts[1:]
+        seg_gap = numpy.maximum(gap_pts[:-1], gap_pts[1:])
+    nrm_lens = numpy.linalg.norm(seg_nrm, axis=1)
+    nrm_lens[nrm_lens < 1e-12] = 1.0
+    seg_nrm = (seg_nrm / nrm_lens[:, None]).astype(numpy.float32)
+    seg_gap = seg_gap[:seg_count].astype(numpy.float32)
+    seg_dir = (delta / seg_len[:, None]).astype(numpy.float32)
+    seg_axis, seg_side = _frame_from_dir_and_normal(seg_dir, seg_nrm)
+    open_start = numpy.zeros(seg_count, dtype=bool)
+    open_end = numpy.zeros(seg_count, dtype=bool)
+    if not cyclic and seg_count > 0:
+        open_start[0] = True
+        open_end[-1] = True
+    return {
+        'segments': segments,
+        'seg_nrm': seg_nrm,
+        'seg_gap': seg_gap,
+        'seg_dir': seg_dir,
+        'seg_axis': seg_axis,
+        'seg_side': seg_side,
+        'path_len': max(total_len, 1e-9),
+        'open_start': open_start,
+        'open_end': open_end,
+        'cyclic': bool(cyclic),
+    }
+
+def _build_path_spline_bundles(prepared, bvh, tris, far_away):
+    '''
+    One bundle per spline. Overlapping ribbons must be evaluated separately so a
+    texel claimed by the nearer curve (but outside its width) can still be
+    painted by another curve that actually covers it.
+    '''
+    bundles = []
+    for polyline, cyclic in prepared:
+        bundle = _build_one_path_spline_bundle(polyline, cyclic, bvh, tris, far_away)
+        if bundle is not None:
+            bundles.append(bundle)
+    return bundles
+
+def _merge_path_spline_bundles(prepared, bvh, tris, far_away):
+    '''Legacy helper: pack every spline into one discontinuous segment soup.'''
+    bundles = _build_path_spline_bundles(prepared, bvh, tris, far_away)
+    if not bundles:
+        return None
+    return {
+        'segments': (
+            numpy.concatenate([b['segments'][0] for b in bundles]),
+            numpy.concatenate([b['segments'][1] for b in bundles]),
+            numpy.concatenate([b['segments'][2] for b in bundles]),
+            numpy.concatenate([b['segments'][3] for b in bundles]),
+            numpy.concatenate([b['segments'][4] for b in bundles]),
+            float(sum(b['segments'][3].sum() for b in bundles)),
+        ),
+        'seg_nrm': numpy.concatenate([b['seg_nrm'] for b in bundles]),
+        'seg_gap': numpy.concatenate([b['seg_gap'] for b in bundles]),
+        'seg_dir': numpy.concatenate([b['seg_dir'] for b in bundles]),
+        'seg_axis': numpy.concatenate([b['seg_axis'] for b in bundles]),
+        'seg_side': numpy.concatenate([b['seg_side'] for b in bundles]),
+        'path_len': numpy.concatenate([
+            numpy.full(b['segments'][0].shape[0], b['path_len'], dtype=numpy.float32)
+            for b in bundles
+        ]),
+        'open_start': numpy.concatenate([b['open_start'] for b in bundles]),
+        'open_end': numpy.concatenate([b['open_end'] for b in bundles]),
+        'spline_count': len(bundles),
+    }
+
 def _closest_on_polyline(points, segments, search_radius, chunk_elems=1500000):
     '''
     Closest point on the polyline for every point.
     Returns (distance, arc length, segment t, segment index, closest point).
     Distance stays inf where no segment is within search_radius.
+
+    Strategy: hash segment starts into a coarse grid, pick the nearest sample
+    per point, then refine against a few neighbouring segments only.
     '''
     start, delta, delta2, seg_len, arc_start, _total = segments
     count = points.shape[0]
     seg_count = start.shape[0]
-
     dist = numpy.full(count, numpy.inf, dtype=numpy.float32)
     arc = numpy.zeros(count, dtype=numpy.float32)
     seg_t = numpy.zeros(count, dtype=numpy.float32)
     seg_i = numpy.zeros(count, dtype=numpy.int32)
     closest = numpy.zeros((count, 3), dtype=numpy.float32)
+    if count == 0 or seg_count == 0:
+        return dist, arc, seg_t, seg_i, closest
 
-    end = start + delta
-    box_min = numpy.minimum(start, end) - search_radius
-    box_max = numpy.maximum(start, end) + search_radius
+    radius = max(float(search_radius), 1e-9)
+    cell = radius
 
-    # Bucket the points spatially, so each batch only has to test the handful of
-    # segments that reach its own neighbourhood
-    cell = max(float(search_radius) * 2.0, 1e-9)
-    keys = numpy.floor(points / cell).astype(numpy.int64)
+    # Cheap reject: ignore texels outside the dilated curve bounds
+    end_pts = start + delta
+    world_lo = numpy.minimum(start, end_pts).min(axis=0) - radius
+    world_hi = numpy.maximum(start, end_pts).max(axis=0) + radius
+    in_bounds = numpy.all((points >= world_lo) & (points <= world_hi), axis=1)
+    active = numpy.nonzero(in_bounds)[0]
+    if active.size == 0:
+        return dist, arc, seg_t, seg_i, closest
+
+    # Stamp each segment start into its own cell. Queries search the 3×3×3
+    # neighbourhood so a point still sees every sample within ~radius.
+    grid = {}
+    skeys = numpy.floor(start / cell).astype(numpy.int64)
+    for si in range(seg_count):
+        key = (int(skeys[si, 0]), int(skeys[si, 1]), int(skeys[si, 2]))
+        bucket = grid.get(key)
+        if bucket is None:
+            grid[key] = [si]
+        else:
+            bucket.append(si)
+    if not grid:
+        return dist, arc, seg_t, seg_i, closest
+    for key, vals in list(grid.items()):
+        grid[key] = numpy.asarray(vals, dtype=numpy.int32)
+
+    sub = points[active]
+    keys = numpy.floor(sub / cell).astype(numpy.int64)
     order = numpy.lexsort((keys[:, 2], keys[:, 1], keys[:, 0]))
     sorted_keys = keys[order]
-    if count > 1:
+    if active.size > 1:
         edges = numpy.nonzero(numpy.any(numpy.diff(sorted_keys, axis=0) != 0, axis=1))[0] + 1
         buckets = numpy.split(order, edges)
     else:
         buckets = [order]
 
+    refine = 2
+    r2 = radius * radius
+    refine_offs = numpy.arange(-refine, refine + 1, dtype=numpy.int32)
+
     for bucket in buckets:
-        bucket_pts = points[bucket]
-        lo = bucket_pts.min(axis=0)
-        hi = bucket_pts.max(axis=0)
-        near = numpy.nonzero(numpy.all((box_max >= lo) & (box_min <= hi), axis=1))[0]
-        if near.size == 0:
+        local = bucket  # indices into sub/keys
+        p0 = int(local[0])
+        cx, cy, cz = int(keys[p0, 0]), int(keys[p0, 1]), int(keys[p0, 2])
+        sample_lists = []
+        for ix in range(cx - 1, cx + 2):
+            for iy in range(cy - 1, cy + 2):
+                for iz in range(cz - 1, cz + 2):
+                    hit = grid.get((ix, iy, iz))
+                    if hit is not None:
+                        sample_lists.append(hit)
+        if not sample_lists:
+            continue
+        samples = numpy.unique(numpy.concatenate(sample_lists)) if len(sample_lists) > 1 else sample_lists[0]
+        if samples.size == 0:
             continue
 
-        seg_a = start[near]
-        seg_d = delta[near]
-        seg_2 = delta2[near]
-        step = max(256, int(chunk_elems // near.size))
-        for base in range(0, bucket.shape[0], step):
-            where = bucket[base:base + step]
-            chunk = points[where]
-            rel = chunk[:, None, :] - seg_a[None, :, :]
-            t = numpy.einsum('msk,sk->ms', rel, seg_d) / seg_2[None, :]
+        sample_pts = start[samples]
+        step = max(256, int(chunk_elems // max(int(samples.size), 1)))
+        for base in range(0, local.shape[0], step):
+            loc = local[base:base + step]
+            where = active[loc]
+            chunk = sub[loc]
+            diff_s = chunk[:, None, :] - sample_pts[None, :, :]
+            d2_s = numpy.einsum('msk,msk->ms', diff_s, diff_s)
+            best_s = numpy.argmin(d2_s, axis=1)
+            seed = samples[best_s]
+            rough = d2_s[numpy.arange(chunk.shape[0]), best_s]
+            cand = rough <= (r2 * 4.0)
+            if not numpy.any(cand):
+                continue
+
+            where_c = where[cand]
+            seed_c = seed[cand]
+            chunk_c = chunk[cand]
+
+            # Per-point window of neighbouring segments — fully vectorized refine
+            near = numpy.clip(seed_c[:, None] + refine_offs[None, :], 0, seg_count - 1)
+            seg_a = start[near]
+            seg_d = delta[near]
+            seg_2 = delta2[near]
+            rel = chunk_c[:, None, :] - seg_a
+            t = numpy.einsum('msk,msk->ms', rel, seg_d) / seg_2
             numpy.clip(t, 0.0, 1.0, out=t)
-            proj = seg_a[None, :, :] + t[:, :, None] * seg_d[None, :, :]
-            diff = chunk[:, None, :] - proj
+            proj = seg_a + t[:, :, None] * seg_d
+            diff = chunk_c[:, None, :] - proj
             d2 = numpy.einsum('msk,msk->ms', diff, diff)
 
             best = numpy.argmin(d2, axis=1)
-            rows = numpy.arange(chunk.shape[0])
-            picked = near[best]
+            rows = numpy.arange(chunk_c.shape[0])
+            picked = near[rows, best]
             best_t = t[rows, best]
-            dist[where] = numpy.sqrt(d2[rows, best])
-            seg_t[where] = best_t
-            seg_i[where] = picked
-            arc[where] = arc_start[picked] + best_t * seg_len[picked]
-            closest[where] = proj[rows, best]
+            best_d2 = d2[rows, best]
+            ok = best_d2 <= r2
+            if not numpy.any(ok):
+                continue
+            idx_ok = where_c[ok]
+            best_d = numpy.sqrt(best_d2[ok])
+            dist[idx_ok] = best_d
+            seg_t[idx_ok] = best_t[ok]
+            seg_i[idx_ok] = picked[ok]
+            arc[idx_ok] = arc_start[picked[ok]] + best_t[ok] * seg_len[picked[ok]]
+            closest[idx_ok] = proj[rows[ok], best[ok]]
 
     return dist, arc, seg_t, seg_i, closest
 
@@ -1626,6 +1805,23 @@ def _decimate_points(points, max_points):
         return list(points)
     step = count / float(max_points)
     return [points[min(count - 1, int(i * step))] for i in range(max_points)]
+
+def _decimate_polyline_for_width(points, half_w, max_points=384):
+    '''
+    Thin a curve so segment spacing tracks ribbon width.
+    Dense samples make closest-point O(points×segments) explode; the ribbon
+    only needs a few segments across its width.
+    '''
+    count = len(points)
+    if count <= 2:
+        return list(points)
+    total = 0.0
+    for i in range(1, count):
+        total += (points[i] - points[i - 1]).length
+    spacing = max(float(half_w) * 0.4, total / float(max(max_points - 1, 1)), 1e-6)
+    target = int(math.ceil(total / spacing)) + 1
+    target = max(2, min(int(max_points), target))
+    return _decimate_points(points, target)
 
 def _rasterize_polygon_grid(poly_x, poly_y, grid_w, grid_h):
     '''Even-odd fill of a closed polygon given in grid coordinates.'''
@@ -1974,18 +2170,26 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
     loop_entries = _curve_to_polylines(
         curve_obj, resolution=max(int(resolution), 32), shrinkwrap_method=method
     )
-    prepared = []
+    raw_loops = []
     for polyline, cyclic in loop_entries:
         if cyclic and len(polyline) >= 3 and (polyline[0] - polyline[-1]).length < 1e-4:
             polyline = polyline[:-1]
-        polyline = _decimate_points(polyline, 2048)
         if len(polyline) >= 2:
-            prepared.append((polyline, cyclic))
-    if not prepared:
+            raw_loops.append((polyline, cyclic))
+    if not raw_loops:
         return False, 'Curve has too few points to bake'
 
     obj_dim = max(obj.dimensions) if obj.dimensions.length > 0 else 1.0
     half_w = max(float(width), 1e-6) * 0.5
+    # Thin dense samples — closest-point cost scales with segment count
+    prepared = [
+        (_decimate_polyline_for_width(polyline, half_w), cyclic)
+        for polyline, cyclic in raw_loops
+    ]
+    prepared = [(pl, cy) for pl, cy in prepared if len(pl) >= 2]
+    if not prepared:
+        return False, 'Curve has too few points to bake'
+
     # How far the curve may hover over the surface and still paint it
     if project_distance is None:
         project_distance = max(half_w * 8.0, obj_dim * 0.08)
@@ -1995,7 +2199,7 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
     tex_pxs, tw, th = _load_texture_pixels(path_texture)
     use_tex = tex_pxs is not None
 
-    # Search far enough that a panel gap under a hovering curve still contributes
+    # Closest-point radius must cover curve hover above the surface.
     depth_reach = hover_ceiling + half_w
     search_r = math.sqrt(depth_reach * depth_reach + (half_w * 1.1) ** 2)
     query_pts = []
@@ -2007,11 +2211,24 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
         )
     else:
         spacing = 0.0
-    cand_idx = _tris_near_points(bvh, len(tris), query_pts, search_r + spacing * 0.5)
+    # Triangle gather only needs lateral ribbon reach + the real curve/surface gap.
+    # Using hover_ceiling here pulled in nearly the whole mesh and made closest-point O(n²).
+    gap_samples = []
+    stride = max(1, len(query_pts) // 48)
+    for p in query_pts[::stride]:
+        try:
+            hit = bvh.find_nearest(p)
+        except Exception:
+            hit = None
+        if hit and hit[0] is not None:
+            gap_samples.append(float(hit[3]))
+    median_gap = float(numpy.median(gap_samples)) if gap_samples else hover_ceiling
+    tri_r = half_w * 3.0 + median_gap * 2.0 + spacing * 0.5
+    cand_idx = _tris_near_points(bvh, len(tris), query_pts, tri_r)
     if cand_idx is None:
         curve_np = numpy.array([[p.x, p.y, p.z] for p in query_pts], dtype=numpy.float32)
-        lo = curve_np.min(axis=0) - search_r
-        hi = curve_np.max(axis=0) + search_r
+        lo = curve_np.min(axis=0) - tri_r
+        hi = curve_np.max(axis=0) + tri_r
         tri_lo = verts.min(axis=1)
         tri_hi = verts.max(axis=1)
         cand_idx = numpy.nonzero(numpy.all((tri_hi >= lo) & (tri_lo <= hi), axis=1))[0]
@@ -2021,52 +2238,32 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
     seam_pairs = _build_uv_seam_pairs(verts, tri_uvs, cand_idx)
     accum = _BakeAccumulator(img_w, img_h, use_tex)
     far_away = obj_dim * 1000.0 + 1.0
-    seal_segments = []
-    splines_baked = 0
 
-    for polyline, cyclic in prepared:
-        sample_nrm = []
-        sample_gap = []
-        for p in polyline:
-            hit = _nearest_uv(bvh, tris, p)
-            if hit:
-                sample_nrm.append(hit[1])
-                sample_gap.append(float(hit[3]))
-            else:
-                sample_nrm.append(Vector((0.0, 0.0, 1.0)))
-                sample_gap.append(far_away)
+    bundles = _build_path_spline_bundles(prepared, bvh, tris, far_away)
+    if not bundles:
+        return False, 'Curve has too few points to bake'
+    splines_baked = len(bundles)
 
-        segments = _polyline_to_segments(polyline, cyclic)
-        if segments is None:
-            continue
-        _seg_start, seg_delta, _seg_delta2, seg_len, _seg_arc, total_len = segments
-        seg_count = seg_delta.shape[0]
+    # Gather surface texels once; evaluate each spline separately so crossings
+    # max-blend instead of the nearer curve punching a hole in the other.
+    gathered_batches = []
+    for batch in _batch_tri_indices(tri_uvs, cand_idx, img_w, img_h):
+        gathered = _gather_surface_texels(batch, verts, tri_uvs, tri_nrms, img_w, img_h)
+        if gathered is not None:
+            gathered_batches.append(gathered)
 
-        nrm_pts = _smooth_rows(
-            numpy.array([[n.x, n.y, n.z] for n in sample_nrm], dtype=numpy.float32), 2, cyclic
-        )
-        gap_pts = numpy.array(sample_gap, dtype=numpy.float32)
-        if cyclic and nrm_pts.shape[0] >= 3:
-            seg_nrm = nrm_pts + numpy.roll(nrm_pts, -1, axis=0)
-            seg_gap = numpy.maximum(gap_pts, numpy.roll(gap_pts, -1))
-        else:
-            seg_nrm = nrm_pts[:-1] + nrm_pts[1:]
-            seg_gap = numpy.maximum(gap_pts[:-1], gap_pts[1:])
-        nrm_lens = numpy.linalg.norm(seg_nrm, axis=1)
-        nrm_lens[nrm_lens < 1e-12] = 1.0
-        seg_nrm = (seg_nrm / nrm_lens[:, None]).astype(numpy.float32)
-        seg_gap = seg_gap[:seg_count].astype(numpy.float32)
-        seg_dir = (seg_delta / seg_len[:, None]).astype(numpy.float32)
-        # One continuous ribbon frame along this spline — shared across UV seams
-        seg_axis, seg_side = _frame_from_dir_and_normal(seg_dir, seg_nrm)
+    for bundle in bundles:
+        segments = bundle['segments']
+        seg_nrm = bundle['seg_nrm']
+        seg_gap = bundle['seg_gap']
+        seg_dir = bundle['seg_dir']
+        seg_axis = bundle['seg_axis']
+        seg_side = bundle['seg_side']
+        path_len = bundle['path_len']
+        open_start = bundle['open_start']
+        open_end = bundle['open_end']
 
-        wrote = False
-        for batch in _batch_tri_indices(tri_uvs, cand_idx, img_w, img_h):
-            gathered = _gather_surface_texels(batch, verts, tri_uvs, tri_nrms, img_w, img_h)
-            if gathered is None:
-                continue
-            ys, xs, pts, nrm, world_per_px = gathered
-
+        for ys, xs, pts, nrm, world_per_px in gathered_batches:
             dist, arc, seg_t, seg_i, closest = _closest_on_polyline(pts, segments, search_r)
             offset = pts - closest
             near = numpy.isfinite(dist)
@@ -2089,7 +2286,6 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
 
             # Crease wrap: faces that turn away still get a cylinder around the curve
             away = numpy.einsum('ij,ij->i', nrm, seg_nrm[seg_i]) <= -0.15
-            # Cylinder radius in the plane ⊥ tangent (no along-curve → no spheres)
             along = numpy.einsum('ij,ij->i', offset, tangent)
             perp = offset - along[:, None] * tangent
             d_cyl = numpy.sqrt(numpy.einsum('ij,ij->i', perp, perp))
@@ -2101,45 +2297,43 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
             )
 
             keep = d_eff <= half_w + slack
-            if not cyclic:
-                keep &= ~(
-                    ((seg_i == 0) & (seg_t <= 1e-6))
-                    | ((seg_i == seg_count - 1) & (seg_t >= 1.0 - 1e-6))
-                )
+            keep &= ~(
+                (open_start[seg_i] & (seg_t <= 1e-6))
+                | (open_end[seg_i] & (seg_t >= 1.0 - 1e-6))
+            )
             if not numpy.any(keep):
                 continue
 
-            ys = ys[keep]
-            xs = xs[keep]
-            pts = pts[keep]
+            ys_k = ys[keep]
+            xs_k = xs[keep]
+            pts_k = pts[keep]
             d_eff = d_eff[keep]
             lat = lat[keep]
             arc = arc[keep]
-            closest = closest[keep]
-            world_per_px = world_per_px[keep]
-            away = away[keep]
+            closest_k = closest[keep]
+            world_per_px_k = world_per_px[keep]
+            away_k = away[keep]
 
-            # Only true back-faces are occlusion-tested (grazing seam hits ignored)
-            suspect = numpy.nonzero(away)[0]
+            suspect = numpy.nonzero(away_k)[0]
             if suspect.size:
                 if suspect.size > _OCCLUSION_TEST_LIMIT:
                     blocked = numpy.ones(suspect.size, dtype=bool)
                 else:
-                    blocked = _reject_occluded(bvh, closest[suspect], pts[suspect])
+                    blocked = _reject_occluded(bvh, closest_k[suspect], pts_k[suspect])
                 if numpy.any(blocked):
-                    visible = numpy.ones(ys.shape[0], dtype=bool)
+                    visible = numpy.ones(ys_k.shape[0], dtype=bool)
                     visible[suspect[blocked]] = False
-                    ys = ys[visible]
-                    xs = xs[visible]
+                    ys_k = ys_k[visible]
+                    xs_k = xs_k[visible]
                     d_eff = d_eff[visible]
                     lat = lat[visible]
                     arc = arc[visible]
-                    world_per_px = world_per_px[visible]
-            if ys.shape[0] == 0:
+                    world_per_px_k = world_per_px_k[visible]
+            if ys_k.shape[0] == 0:
                 continue
 
             edge = numpy.clip(
-                (half_w - d_eff) / numpy.clip(world_per_px * 0.7, 1e-9, half_w * 0.5) + 0.5,
+                (half_w - d_eff) / numpy.clip(world_per_px_k * 0.7, 1e-9, half_w * 0.5) + 0.5,
                 0.0, 1.0
             ).astype(numpy.float32)
             if falloff <= 0.0:
@@ -2151,27 +2345,23 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
             if use_tex:
                 across = lat / half_w
                 sampled = _sample_path_texture_batch(
-                    tex_pxs, tw, th, arc / max(total_len, 1e-9),
+                    tex_pxs, tw, th, arc / path_len,
                     numpy.clip(across, -1.0, 1.0),
                     tile_u=tile_u, rotation_deg=rotation_deg
                 )
                 alpha = alpha * sampled[:, 3]
                 rgb = sampled[:, :3]
 
-            accum.add(ys, xs, alpha.astype(numpy.float32), rgb)
-            wrote = True
-
-        if wrote:
-            seal_segments.append(segments)
-            splines_baked += 1
+            accum.add(ys_k, xs_k, alpha.astype(numpy.float32), rgb)
 
     if accum.count == 0:
         return False, 'No path pixels found on the surface (move the curve closer to the mesh)'
 
     coverage, rgb_buf = accum.resolve()
-    # Paint both UV images of every seam edge under each spline's ribbon
-    for segments in seal_segments:
-        _seal_uv_seams_path(coverage, seam_pairs, segments, half_w, hover_ceiling, img_w, img_h)
+    for bundle in bundles:
+        _seal_uv_seams_path(
+            coverage, seam_pairs, bundle['segments'], half_w, hover_ceiling, img_w, img_h
+        )
     pxs = _read_image_pixels(image, img_w, img_h)
     filled = _composite_bake(pxs, coverage, rgb_buf, color, clear)
     _write_image_pixels(image, pxs)
@@ -2179,6 +2369,7 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
     return True, 'Baked path ribbon (%d pixels, %d spline(s)) [%s]' % (
         filled, splines_baked, 'Project' if method == 'PROJECT' else 'Nearest'
     )
+
 
 def _poll_curve_object(self, obj):
     return obj and obj.type == 'CURVE'
