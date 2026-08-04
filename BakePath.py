@@ -3237,6 +3237,262 @@ class YCreatePathCurveForLayer(bpy.types.Operator):
         self.report({'INFO'}, "Created %s curve '%s'" % ('shape' if is_shape else 'path', curve_obj.name))
         return {'FINISHED'}
 
+def iter_path_bake_layers_with_image(yp):
+    '''Yield path/shape bake layers that already have a bake image.'''
+    for layer in yp.layers:
+        if layer.type != 'IMAGE':
+            continue
+        if not getattr(layer, 'enable_path_bake', False):
+            continue
+        source = get_layer_source(layer)
+        if source and source.image:
+            yield layer
+
+def apply_path_bake_as_mask(path_layer, target_layer, socket_input_name='Alpha',
+                            blend_type='MULTIPLY', disable_source_layer=True,
+                            interpolation='Linear'):
+    '''
+    Share a path/shape bake image as a UV IMAGE mask on another layer.
+    Returns (mask, error_message).
+    '''
+    from . import Mask
+
+    if not path_layer or not target_layer:
+        return None, 'Missing path or target layer'
+    if path_layer == target_layer:
+        return None, 'Pick a different layer to mask — cannot use a bake on itself'
+
+    source = get_layer_source(path_layer)
+    image = source.image if source else None
+    if not image:
+        return None, "Path/shape layer '%s' has no image — bake it first" % path_layer.name
+
+    for mask in target_layer.masks:
+        if mask.type != 'IMAGE':
+            continue
+        mask_source = get_mask_source(mask)
+        if mask_source and mask_source.image == image:
+            return mask, "Layer '%s' already uses '%s' as a mask" % (
+                target_layer.name, path_layer.name
+            )
+
+    if hasattr(image, 'colorspace_settings'):
+        noncolor = get_noncolor_name()
+        if image.colorspace_settings.name != noncolor and not image.is_dirty:
+            image.colorspace_settings.name = noncolor
+
+    uv_name = path_layer.uv_name or target_layer.uv_name or ''
+    mask = Mask.add_new_mask(
+        target_layer, path_layer.name, 'IMAGE', 'UV', uv_name,
+        image=image, blend_type=blend_type, socket_input_name=socket_input_name,
+        interpolation=interpolation
+    )
+
+    target_layer.enable_masks = True
+    if disable_source_layer:
+        path_layer.enable = False
+
+    node_connections.reconnect_layer_nodes(target_layer)
+    node_arrangements.rearrange_layer_nodes(target_layer)
+    node_connections.reconnect_yp_nodes(target_layer.id_data)
+    node_arrangements.rearrange_yp_nodes(target_layer.id_data)
+
+    return mask, None
+
+class YUsePathBakeAsMask(bpy.types.Operator):
+    '''Add a path or shape bake as a UV mask on another layer (ideal for masking decals)'''
+    bl_idname = 'wm.y_use_path_bake_as_mask'
+    bl_label = 'Use Path/Shape as Mask'
+    bl_description = 'Use a path or shape bake image as a UV mask on a layer. Rebaking the path updates the mask automatically'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    mode : EnumProperty(
+        name = 'Mode',
+        items = (
+            ('PICK_TARGET', 'Pick Target Layer', 'Use the current path/shape bake as a mask on another layer'),
+            ('PICK_PATH', 'Pick Path/Shape', 'Pick a path/shape bake to mask the current layer'),
+        ),
+        default = 'PICK_TARGET'
+    )
+
+    path_layer_name : StringProperty(name='Path / Shape', default='')
+    target_layer_name : StringProperty(name='Target Layer', default='')
+    path_coll : CollectionProperty(type=bpy.types.PropertyGroup)
+    target_coll : CollectionProperty(type=bpy.types.PropertyGroup)
+
+    socket_input_name : EnumProperty(
+        name = 'Source Input',
+        description = 'Path/shape bakes store coverage in Alpha; Color works if the bake is white',
+        items = (
+            ('Alpha', 'Alpha', 'Use image alpha (recommended for path/shape coverage)'),
+            ('Color', 'Color', 'Use image color'),
+        ),
+        default = 'Alpha'
+    )
+
+    blend_type : EnumProperty(
+        name = 'Blend',
+        description = 'How the mask combines with the layer',
+        items = mask_blend_type_items,
+        default = 3 if is_bl_newer_than(2, 90) else None,
+    )
+
+    disable_source_layer : BoolProperty(
+        name = 'Disable Path/Shape Layer',
+        description = 'Turn off the path/shape layer so it only contributes as a mask (rebakes still update the shared image)',
+        default = True
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return get_active_ypaint_node() is not None
+
+    def _resolve_context_layer(self, context):
+        layer = getattr(context, 'layer', None)
+        if layer:
+            return layer
+        node = get_active_ypaint_node()
+        if not node:
+            return None
+        return get_active_layer(node.node_tree.yp)
+
+    def invoke(self, context, event):
+        node = get_active_ypaint_node()
+        if not node:
+            self.report({'ERROR'}, 'No UcuPaint node')
+            return {'CANCELLED'}
+        yp = node.node_tree.yp
+        context_layer = self._resolve_context_layer(context)
+
+        self.path_coll.clear()
+        path_layers = list(iter_path_bake_layers_with_image(yp))
+        for layer in path_layers:
+            self.path_coll.add().name = layer.name
+
+        self.target_coll.clear()
+        # Prefer Decal layers at the top of the picker
+        others = [l for l in yp.layers if context_layer is None or l != context_layer]
+        decals = [l for l in others if getattr(l, 'texcoord_type', '') == 'Decal']
+        rest = [l for l in others if l not in decals]
+        for layer in decals + rest:
+            label = layer.name
+            if getattr(layer, 'texcoord_type', '') == 'Decal':
+                label = layer.name  # name is enough; sorted first
+            self.target_coll.add().name = label
+
+        if self.mode == 'PICK_TARGET':
+            if context_layer and getattr(context_layer, 'enable_path_bake', False):
+                self.path_layer_name = context_layer.name
+            elif self.path_coll:
+                self.path_layer_name = self.path_coll[0].name
+            else:
+                self.report({'ERROR'}, 'No path/shape bake with an image found')
+                return {'CANCELLED'}
+
+            # Default target: active layer if different, else first Decal, else first other
+            active = get_active_layer(yp)
+            if active and active.name != self.path_layer_name and active.name in [c.name for c in self.target_coll]:
+                self.target_layer_name = active.name
+            elif decals:
+                self.target_layer_name = decals[0].name
+            elif self.target_coll:
+                self.target_layer_name = self.target_coll[0].name
+            else:
+                self.report({'ERROR'}, 'No other layer to mask')
+                return {'CANCELLED'}
+
+        else:  # PICK_PATH — mask the current layer
+            if not context_layer:
+                self.report({'ERROR'}, 'No active layer')
+                return {'CANCELLED'}
+            self.target_layer_name = context_layer.name
+            # Exclude self from path list if it is a path layer
+            self.path_coll.clear()
+            for layer in path_layers:
+                if layer == context_layer:
+                    continue
+                self.path_coll.add().name = layer.name
+            if not self.path_coll:
+                self.report({'ERROR'}, 'No other path/shape bake with an image found')
+                return {'CANCELLED'}
+            self.path_layer_name = self.path_coll[0].name
+
+        target = yp.layers.get(self.target_layer_name)
+        if target and len(target.masks) == 0:
+            self.blend_type = 'MULTIPLY'
+
+        return context.window_manager.invoke_props_dialog(self, width=360)
+
+    def draw(self, context):
+        layout = self.layout
+        col = layout.column(align=True)
+
+        if self.mode == 'PICK_TARGET':
+            col.label(text='Path / Shape:  %s' % self.path_layer_name)
+            col.separator()
+            col.label(text='Mask this layer:')
+            col.prop_search(self, 'target_layer_name', self, 'target_coll', text='', icon='NODE')
+        else:
+            col.label(text='Target layer:  %s' % self.target_layer_name)
+            col.separator()
+            col.label(text='Use this path/shape:')
+            col.prop_search(self, 'path_layer_name', self, 'path_coll', text='', icon='CURVE_DATA' if is_bl_newer_than(2, 80) else 'CURVE_BEZCURVE')
+
+        col.separator()
+        row = col.row(align=True)
+        row.label(text='Input')
+        row.prop(self, 'socket_input_name', expand=True)
+        col.prop(self, 'blend_type', text='Blend')
+        col.prop(self, 'disable_source_layer')
+
+    def execute(self, context):
+        node = get_active_ypaint_node()
+        if not node:
+            self.report({'ERROR'}, 'No UcuPaint node')
+            return {'CANCELLED'}
+        yp = node.node_tree.yp
+
+        path_layer = yp.layers.get(self.path_layer_name)
+        target_layer = yp.layers.get(self.target_layer_name)
+        if not path_layer:
+            self.report({'ERROR'}, "Path/shape layer '%s' not found" % self.path_layer_name)
+            return {'CANCELLED'}
+        if not target_layer:
+            self.report({'ERROR'}, "Target layer '%s' not found" % self.target_layer_name)
+            return {'CANCELLED'}
+
+        mask, err = apply_path_bake_as_mask(
+            path_layer, target_layer,
+            socket_input_name=self.socket_input_name,
+            blend_type=self.blend_type,
+            disable_source_layer=self.disable_source_layer
+        )
+        if err and mask is None:
+            self.report({'ERROR'}, err)
+            return {'CANCELLED'}
+        if err and mask is not None:
+            self.report({'WARNING'}, err)
+            return {'CANCELLED'}
+
+        from .subtree import check_yp_linear_nodes
+        check_yp_linear_nodes(yp)
+
+        ypui = context.window_manager.ypui
+        ypui.layer_ui.expand_masks = True
+        ypui.need_update = True
+
+        # Jump UI to the masked (decal) layer
+        idx = get_layer_index(target_layer)
+        if idx >= 0:
+            yp.active_layer_index = idx
+
+        tag = 'Decal' if getattr(target_layer, 'texcoord_type', '') == 'Decal' else 'layer'
+        self.report(
+            {'INFO'},
+            "Using '%s' as mask on %s '%s'" % (path_layer.name, tag, target_layer.name)
+        )
+        return {'FINISHED'}
+
 def draw_path_bake_ui(layout, context, layer):
     '''Draw Path Bake controls for an IMAGE layer.'''
     if layer.type != 'IMAGE':
@@ -3337,6 +3593,20 @@ def draw_path_bake_ui(layout, context, layer):
     brow.enabled = can_bake_all
     brow.operator('wm.y_bake_all_paths', text='Bake All Paths', icon_value=lib_get_bake_icon())
 
+    col.separator()
+    mask_row = col.row(align=True)
+    mask_row.context_pointer_set('layer', layer)
+    mask_row.scale_y = 1.15
+    has_img = bake_img is not None
+    mask_row.enabled = has_img
+    mask_icon = 'MOD_MASK' if is_bl_newer_than(2, 80) else 'IMAGE_ALPHA'
+    op = mask_row.operator(
+        'wm.y_use_path_bake_as_mask',
+        text='Use as Mask on Layer…',
+        icon=mask_icon
+    )
+    op.mode = 'PICK_TARGET'
+
 def lib_get_bake_icon():
     from . import lib
     return lib.get_icon('bake')
@@ -3348,6 +3618,7 @@ def register():
     bpy.utils.register_class(YResizePathBakeImage)
     bpy.utils.register_class(YSelectPathCurve)
     bpy.utils.register_class(YCreatePathCurveForLayer)
+    bpy.utils.register_class(YUsePathBakeAsMask)
 
 def unregister():
     bpy.utils.unregister_class(YNewPathLayer)
@@ -3356,3 +3627,4 @@ def unregister():
     bpy.utils.unregister_class(YResizePathBakeImage)
     bpy.utils.unregister_class(YSelectPathCurve)
     bpy.utils.unregister_class(YCreatePathCurveForLayer)
+    bpy.utils.unregister_class(YUsePathBakeAsMask)

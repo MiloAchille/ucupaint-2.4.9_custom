@@ -6839,6 +6839,22 @@ class YAddLayerMaskMenu(bpy.types.Menu):
         op.texcoord_type = 'UV'
         op.file_browser_filepath = ''
         new_mask_button(col, 'wm.y_open_existing_data_as_mask', 'Open Existing Image as Mask', lib_icon='open_image', otype='IMAGE')
+        # Path / shape bake as mask (shared image; great for masking Decal layers)
+        has_path_mask = False
+        node = get_active_ypaint_node()
+        if node:
+            from .BakePath import iter_path_bake_layers_with_image
+            has_path_mask = any(
+                layer != context.layer
+                for layer in iter_path_bake_layers_with_image(node.node_tree.yp)
+            )
+        if has_path_mask:
+            op = col.operator(
+                'wm.y_use_path_bake_as_mask',
+                text='Path / Shape Bake as Mask…',
+                icon_value=lib.get_icon('image')
+            )
+            op.mode = 'PICK_PATH'
         col.separator()
 
         col.label(text=get_vertex_color_label()+' Mask:')
