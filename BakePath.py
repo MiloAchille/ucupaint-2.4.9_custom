@@ -1098,108 +1098,6 @@ def _splat_rgba(pxs, width, height, u, v, rgba, strength, radius_px=1.0):
             w = w * w
             _blend_pixel(pxs, px, py, rgba, strength * w)
 
-def _splat_coverage_max(cov, width, height, u, v, strength, radius_px=1.25):
-    '''Max-blend soft coverage stamp — no alpha-over banding between overlaps.'''
-    if strength <= 1e-6:
-        return
-    if u < 0.0 or u > 1.0 or v < 0.0 or v > 1.0:
-        return
-    x = u * (width - 1)
-    y = v * (height - 1)
-    radius = max(0.75, float(radius_px))
-    r_ceil = int(math.ceil(radius)) + 1
-    x0 = max(0, int(math.floor(x)) - r_ceil)
-    x1 = min(width - 1, int(math.ceil(x)) + r_ceil)
-    y0 = max(0, int(math.floor(y)) - r_ceil)
-    y1 = min(height - 1, int(math.ceil(y)) + r_ceil)
-    inv_r = 1.0 / radius
-    for py in range(y0, y1 + 1):
-        for px in range(x0, x1 + 1):
-            dx = px - x
-            dy = py - y
-            d = math.sqrt(dx * dx + dy * dy) * inv_r
-            if d > 1.0:
-                continue
-            w = 1.0 - d
-            w = w * w
-            val = strength * w
-            if val > cov[py, px]:
-                cov[py, px] = val
-
-def _barycentric_2d(px, py, ax, ay, bx, by, cx, cy):
-    v0x, v0y = bx - ax, by - ay
-    v1x, v1y = cx - ax, cy - ay
-    v2x, v2y = px - ax, py - ay
-    den = v0x * v1y - v1x * v0y
-    if abs(den) < 1e-12:
-        return None
-    inv = 1.0 / den
-    v = (v2x * v1y - v1x * v2y) * inv
-    w = (v0x * v2y - v2x * v0y) * inv
-    u = 1.0 - v - w
-    return u, v, w
-
-def _fill_uv_tri_coverage(cov, img_w, img_h, uv_a, s_a, uv_b, s_b, uv_c, s_c):
-    '''Rasterize a UV triangle into a coverage buffer with interpolated strength.'''
-    ax, ay = uv_a.x * (img_w - 1), uv_a.y * (img_h - 1)
-    bx, by = uv_b.x * (img_w - 1), uv_b.y * (img_h - 1)
-    cx, cy = uv_c.x * (img_w - 1), uv_c.y * (img_h - 1)
-    min_x = max(0, int(math.floor(min(ax, bx, cx))))
-    max_x = min(img_w - 1, int(math.ceil(max(ax, bx, cx))))
-    min_y = max(0, int(math.floor(min(ay, by, cy))))
-    max_y = min(img_h - 1, int(math.ceil(max(ay, by, cy))))
-    if min_x > max_x or min_y > max_y:
-        return 0
-    filled = 0
-    for py in range(min_y, max_y + 1):
-        # Sample at pixel centers
-        fy = py + 0.5
-        for px in range(min_x, max_x + 1):
-            fx = px + 0.5
-            bary = _barycentric_2d(fx, fy, ax, ay, bx, by, cx, cy)
-            if not bary:
-                continue
-            u, v, w = bary
-            if u < -1e-4 or v < -1e-4 or w < -1e-4:
-                continue
-            s = s_a * u + s_b * v + s_c * w
-            if s <= 1e-6:
-                continue
-            if s > cov[py, px]:
-                cov[py, px] = s
-                filled += 1
-    return filled
-
-def _fill_uv_quad_coverage(cov, img_w, img_h, uv00, s00, uv10, s10, uv11, s11, uv01, s01):
-    '''Fill UV quad (00-10-11-01) as two triangles into coverage.'''
-    n = _fill_uv_tri_coverage(cov, img_w, img_h, uv00, s00, uv10, s10, uv11, s11)
-    n += _fill_uv_tri_coverage(cov, img_w, img_h, uv00, s00, uv11, s11, uv01, s01)
-    return n
-
-def _parallel_transport_side(prev_side, prev_tangent, tangent):
-    '''Carry ribbon side along the path so mesh-normal flips don't invert the frame.'''
-    if prev_side is None or prev_tangent is None or tangent is None:
-        return None
-    if prev_tangent.length < 1e-8 or tangent.length < 1e-8:
-        return None
-    t0 = prev_tangent.normalized()
-    t1 = tangent.normalized()
-    side = prev_side.copy()
-    axis = t0.cross(t1)
-    if axis.length > 1e-8:
-        try:
-            angle = t0.angle(t1)
-        except Exception:
-            angle = 0.0
-        if abs(angle) > 1e-8:
-            side = Matrix.Rotation(angle, 3, axis.normalized()) @ side
-    elif t0.dot(t1) < 0.0:
-        side = -side
-    side = side - t1 * side.dot(t1)
-    if side.length < 1e-8:
-        return None
-    return side.normalized()
-
 def _sample_path_texture(tex_pxs, tw, th, u_len, v_across, tile_u=1.0, rotation_deg=0.0):
     '''Sample path stamp texture. u_len 0..1 along path, v_across -1..1 across width.'''
     uu = (u_len * tile_u) % 1.0
@@ -1928,13 +1826,12 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
 
     half_w = width * 0.5
     n_len = len(polyline)
-    # UV seam jump threshold in pixels — don't bridge / fill across UV islands
+    # UV seam jump threshold in pixels — don't bridge across UV islands
     seam_px = max(img_w, img_h) * 0.08
 
     # Collect per-width-lane samples: list of (uv, u_len, v_across, strength) or None
     lanes = [[] for _ in range(width_samples)]
-    prev_side = None
-    prev_tangent = None
+    stamps = 0
 
     for i in range(n_len):
         p = polyline[i]
@@ -1961,21 +1858,12 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
             continue
         c_loc, c_normal, _, _ = center
 
-        raw_side = c_normal.cross(tangent)
-        if raw_side.length < 1e-8:
-            raw_side = tangent.cross(Vector((0, 0, 1)))
-            if raw_side.length < 1e-8:
-                raw_side = tangent.cross(Vector((0, 1, 0)))
-        if raw_side.length < 1e-8:
-            for lane in lanes:
-                lane.append(None)
-            continue
-        raw_side.normalize()
-        side = _parallel_transport_side(prev_side, prev_tangent, tangent)
-        if side is None:
-            side = raw_side
-        prev_side = side
-        prev_tangent = tangent.copy()
+        side = c_normal.cross(tangent)
+        if side.length < 1e-8:
+            side = tangent.cross(Vector((0, 0, 1)))
+            if side.length < 1e-8:
+                side = tangent.cross(Vector((0, 1, 0)))
+        side.normalize()
 
         u_len = i / float(max(n_len - 1, 1))
         # Lift along normal so creases on low-poly meshes still find a surface hit
@@ -1991,6 +1879,7 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
             sample_pos = c_loc + offset + c_normal * lift
             hit = _nearest_uv(bvh, tris, sample_pos, max_dist=project_distance)
             if not hit:
+                # Fallback without lift
                 hit = _nearest_uv(bvh, tris, c_loc + offset, max_dist=project_distance)
             if not hit:
                 lanes[j].append(None)
@@ -2000,16 +1889,8 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
             strength = _soft_falloff(abs(v_across), power=falloff)
             lanes[j].append((uv.copy(), u_len, v_across, strength))
 
-    # Continuous ribbon raster: coverage-max (no alpha-over sectioning) + UV quads
-    cov = numpy.zeros((img_h, img_w), dtype=numpy.float32)
-    # Optional texture accumulation (RGB weighted by coverage contribution)
-    use_tex = tex_pxs is not None
-    if use_tex:
-        acc_rgb = numpy.zeros((img_h, img_w, 3), dtype=numpy.float32)
-        acc_w = numpy.zeros((img_h, img_w), dtype=numpy.float32)
-
     def _rgba_at(u_len, v_across):
-        if use_tex:
+        if tex_pxs is not None:
             rgba = _sample_path_texture(
                 tex_pxs, tw, th, u_len, v_across,
                 tile_u=tile_u, rotation_deg=rotation_deg
@@ -2022,160 +1903,48 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
             )
         return color
 
-    def _stamp_cov(uv, strength, radius_px=1.35):
-        _splat_coverage_max(cov, img_w, img_h, uv.x, uv.y, strength, radius_px=radius_px)
-
-    def _stamp_tex(uv, u_len, v_across, strength, radius_px=1.35):
-        '''Max coverage + weighted RGB for textured ribbons.'''
-        if strength <= 1e-6:
+    def _bridge_samples(sample_a, sample_b):
+        nonlocal stamps
+        if sample_a is None or sample_b is None:
             return
-        if uv.x < 0.0 or uv.x > 1.0 or uv.y < 0.0 or uv.y > 1.0:
+        uv, u_len, v_across, strength = sample_a
+        uv2, u_len2, v_across2, strength2 = sample_b
+        dist_px = _uv_pixel_dist(uv, uv2, img_w, img_h)
+        if dist_px < 0.5 or dist_px > seam_px:
+            # Too close (already covered) or UV seam jump — don't interpolate
             return
-        rgba = _rgba_at(u_len, v_across)
-        x = uv.x * (img_w - 1)
-        y = uv.y * (img_h - 1)
-        radius = max(0.75, float(radius_px))
-        r_ceil = int(math.ceil(radius)) + 1
-        x0 = max(0, int(math.floor(x)) - r_ceil)
-        x1 = min(img_w - 1, int(math.ceil(x)) + r_ceil)
-        y0 = max(0, int(math.floor(y)) - r_ceil)
-        y1 = min(img_h - 1, int(math.ceil(y)) + r_ceil)
-        inv_r = 1.0 / radius
-        cr, cg, cb, ca = rgba
-        for py in range(y0, y1 + 1):
-            for px in range(x0, x1 + 1):
-                dx = px - x
-                dy = py - y
-                d = math.sqrt(dx * dx + dy * dy) * inv_r
-                if d > 1.0:
-                    continue
-                w = (1.0 - d)
-                w = w * w * strength * ca
-                if w <= 1e-6:
-                    continue
-                if w > cov[py, px]:
-                    cov[py, px] = w
-                acc_rgb[py, px, 0] += cr * w
-                acc_rgb[py, px, 1] += cg * w
-                acc_rgb[py, px, 2] += cb * w
-                acc_w[py, px] += w
+        steps = int(math.ceil(dist_px))
+        radius = max(1.0, dist_px / max(steps, 1) * 0.9)
+        for s in range(1, steps):
+            t = s / float(steps)
+            uv_i = uv.lerp(uv2, t)
+            u_i = u_len * (1.0 - t) + u_len2 * t
+            v_i = v_across * (1.0 - t) + v_across2 * t
+            str_i = strength * (1.0 - t) + strength2 * t
+            rgba_i = _rgba_at(u_i, v_i)
+            _splat_rgba(pxs, img_w, img_h, uv_i.x, uv_i.y, rgba_i, str_i, radius_px=radius)
+            stamps += 1
 
-    filled = 0
-    # 1) Fill continuous UV quads between consecutive cross-sections
-    n_frames = n_len
-    for i in range(n_frames):
-        i1 = i + 1
-        if i1 >= n_frames:
-            if cyclic and n_frames >= 3:
-                i1 = 0
-            else:
-                break
-        for j in range(width_samples - 1):
-            a = lanes[j][i]
-            b = lanes[j + 1][i]
-            c = lanes[j + 1][i1]
-            d = lanes[j][i1]
-            if a is None or b is None or c is None or d is None:
-                continue
-            uv_a, _, _, s_a = a
-            uv_b, _, _, s_b = b
-            uv_c, _, _, s_c = c
-            uv_d, _, _, s_d = d
-            # Skip UV island hops
-            if (
-                _uv_pixel_dist(uv_a, uv_b, img_w, img_h) > seam_px
-                or _uv_pixel_dist(uv_b, uv_c, img_w, img_h) > seam_px
-                or _uv_pixel_dist(uv_c, uv_d, img_w, img_h) > seam_px
-                or _uv_pixel_dist(uv_d, uv_a, img_w, img_h) > seam_px
-                or _uv_pixel_dist(uv_a, uv_d, img_w, img_h) > seam_px
-                or _uv_pixel_dist(uv_b, uv_c, img_w, img_h) > seam_px
-            ):
-                continue
-            filled += _fill_uv_quad_coverage(
-                cov, img_w, img_h,
-                uv_a, s_a, uv_b, s_b, uv_c, s_c, uv_d, s_d,
-            )
-            if use_tex:
-                # Seed texture weights at corners (quad fill is coverage-only)
-                _stamp_tex(uv_a, a[1], a[2], s_a, radius_px=1.0)
-                _stamp_tex(uv_b, b[1], b[2], s_b, radius_px=1.0)
-                _stamp_tex(uv_c, c[1], c[2], s_c, radius_px=1.0)
-                _stamp_tex(uv_d, d[1], d[2], s_d, radius_px=1.0)
-
-    # 2) Dense coverage stamps along each lane (antialias / fill tiny gaps)
+    # Stamp each lane, bridging gaps in UV space between consecutive hits
     for lane in lanes:
         for i, sample in enumerate(lane):
             if sample is None:
                 continue
             uv, u_len, v_across, strength = sample
-            if use_tex:
-                _stamp_tex(uv, u_len, v_across, strength, radius_px=1.25)
-            else:
-                _stamp_cov(uv, strength, radius_px=1.25)
-            filled += 1
+            rgba = _rgba_at(u_len, v_across)
+            _splat_rgba(pxs, img_w, img_h, uv.x, uv.y, rgba, strength, radius_px=1.25)
+            stamps += 1
+
             if not fill_gaps:
                 continue
-            # Bridge to next valid sample
-            nxt = None
             if i + 1 < len(lane):
-                nxt = lane[i + 1]
+                _bridge_samples(sample, lane[i + 1])
             elif cyclic and len(lane) >= 3:
-                nxt = lane[0]
-            if nxt is None:
-                continue
-            uv2, u_len2, v_across2, strength2 = nxt
-            dist_px = _uv_pixel_dist(uv, uv2, img_w, img_h)
-            if dist_px < 0.35 or dist_px > seam_px:
-                continue
-            steps = max(1, int(math.ceil(dist_px / 0.4)))
-            for s in range(1, steps):
-                t = s / float(steps)
-                uv_i = uv.lerp(uv2, t)
-                u_i = u_len * (1.0 - t) + u_len2 * t
-                v_i = v_across * (1.0 - t) + v_across2 * t
-                str_i = strength * (1.0 - t) + strength2 * t
-                if use_tex:
-                    _stamp_tex(uv_i, u_i, v_i, str_i, radius_px=1.1)
-                else:
-                    _stamp_cov(uv_i, str_i, radius_px=1.1)
-                filled += 1
+                # Close the loop: bridge last sample back to the first
+                _bridge_samples(sample, lane[0])
 
-    if filled == 0 or float(numpy.max(cov)) <= 1e-6:
+    if stamps == 0:
         return False, 'No path samples projected onto the mesh (move the curve closer to the surface)'
-
-    # Composite coverage into image — uniform opacity, no stamp banding
-    cr, cg, cb, ca = [float(c) for c in color]
-    src_a = numpy.clip(cov * ca, 0.0, 1.0).astype(numpy.float32)
-    m = src_a > 1e-6
-
-    if use_tex:
-        safe = numpy.maximum(acc_w, 1e-8)[:, :, None]
-        rgb = (acc_rgb / safe).astype(numpy.float32)
-        has = acc_w > 1e-6
-        out_r = numpy.where(has, rgb[:, :, 0], cr).astype(numpy.float32)
-        out_g = numpy.where(has, rgb[:, :, 1], cg).astype(numpy.float32)
-        out_b = numpy.where(has, rgb[:, :, 2], cb).astype(numpy.float32)
-    else:
-        out_r = numpy.full((img_h, img_w), cr, dtype=numpy.float32)
-        out_g = numpy.full((img_h, img_w), cg, dtype=numpy.float32)
-        out_b = numpy.full((img_h, img_w), cb, dtype=numpy.float32)
-
-    if clear:
-        pxs[:, :, 0] = numpy.where(m, out_r, 0.0)
-        pxs[:, :, 1] = numpy.where(m, out_g, 0.0)
-        pxs[:, :, 2] = numpy.where(m, out_b, 0.0)
-        pxs[:, :, 3] = numpy.where(m, src_a, 0.0)
-    else:
-        dst_a = pxs[:, :, 3]
-        out_a = src_a + dst_a * (1.0 - src_a)
-        safe_a = numpy.maximum(out_a, 1e-8)
-        for ch, src in enumerate((out_r, out_g, out_b)):
-            pxs[:, :, ch] = numpy.where(
-                m,
-                (src * src_a + pxs[:, :, ch] * dst_a * (1.0 - src_a)) / safe_a,
-                pxs[:, :, ch],
-            )
-        pxs[:, :, 3] = numpy.where(m, numpy.minimum(out_a, 1.0), dst_a)
 
     flat = pxs.ravel()
     if is_bl_newer_than(2, 83):
@@ -2184,7 +1953,7 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
         image.pixels = flat.tolist()
     image.update()
 
-    return True, 'Baked path ribbon (%d samples, coverage fill)' % filled
+    return True, 'Baked %d path samples (res %d x %d)' % (stamps, n_len, width_samples)
 
 def _poll_curve_object(self, obj):
     return obj and obj.type == 'CURVE'
