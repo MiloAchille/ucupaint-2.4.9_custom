@@ -3689,7 +3689,7 @@ def is_transformed(mapping, entity=None):
 
 def check_uvmap_on_other_objects_with_same_mat(mat, uv_name, set_active=True):
 
-    if mat and mat.users > 1 and uv_name != '':
+    if mat.users > 1 and uv_name != '':
         for ob in get_scene_objects():
             if ob.type != 'MESH': continue
             if mat.name in ob.data.materials:
