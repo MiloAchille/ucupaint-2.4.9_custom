@@ -2191,6 +2191,9 @@ class YNewPathLayer(bpy.types.Operator):
 
         from . import Layer
 
+        # Keep the mesh active while building the layer (curve has no material)
+        set_active_object(obj)
+
         yp.halt_update = True
         layer = Layer.add_new_layer(
             node.node_tree, self.name, 'IMAGE',
