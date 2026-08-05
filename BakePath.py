@@ -27,6 +27,7 @@ def find_path_bake_layer_for_curve(curve_obj):
     '''
     Find the UcuPaint layer linked to this path/shape curve.
     Returns (yp, layer_index) or (None, -1).
+    Prefer PointerProperty matches; name is only a fallback when the pointer is empty.
     '''
     if not curve_obj or curve_obj.type != 'CURVE':
         return None, -1
@@ -34,6 +35,7 @@ def find_path_bake_layer_for_curve(curve_obj):
     if not parent or parent.type != 'MESH':
         return None, -1
 
+    name_fallback = None
     for slot in parent.material_slots:
         mat = slot.material
         if not mat or not mat.node_tree:
@@ -47,12 +49,18 @@ def find_path_bake_layer_for_curve(curve_obj):
             for i, layer in enumerate(yp.layers):
                 if not getattr(layer, 'enable_path_bake', False):
                     continue
-                linked = get_path_curve_object(layer)
+                linked = None
+                if is_bl_newer_than(2, 79) and getattr(layer, 'path_curve_object', None):
+                    linked = layer.path_curve_object
                 if linked == curve_obj:
                     return yp, i
-                # Name fallback if the pointer was cleared / stale
-                if getattr(layer, 'path_curve_object_name', '') == curve_obj.name:
-                    return yp, i
+                # Name fallback only if this layer has no live pointer (avoid stale names
+                # stealing selection from another layer's curve after rename/duplicate)
+                if linked is None and name_fallback is None:
+                    if getattr(layer, 'path_curve_object_name', '') == curve_obj.name:
+                        name_fallback = (yp, i)
+    if name_fallback is not None:
+        return name_fallback
     return None, -1
 
 def get_mesh_for_path_curve(curve_obj):
@@ -107,16 +115,21 @@ _pending_layer_to_curve_tree = None
 _pending_layer_to_curve_index = None
 _last_layer_to_curve_key = None
 _path_sel_sync_lock = False
+# After a layer-list click, ignore curve→layer sync briefly so depsgraph
+# can't snap the active layer back to the previously selected curve.
+_layer_driven_sync_until = 0.0
 
 def clear_path_selection_sync_state():
     '''Drop pending layer↔curve sync (call after deleting curves / layers).'''
     global _pending_path_curve_layer_sync, _pending_layer_to_curve_tree
     global _pending_layer_to_curve_index, _last_layer_to_curve_key, _last_path_curve_layer_sync
+    global _layer_driven_sync_until
     _pending_path_curve_layer_sync = None
     _pending_layer_to_curve_tree = None
     _pending_layer_to_curve_index = None
     _last_layer_to_curve_key = None
     _last_path_curve_layer_sync = None
+    _layer_driven_sync_until = 0.0
 
 def _deferred_path_curve_layer_sync():
     '''Timer callback — RNA writes are unsafe directly from depsgraph/msgbus.'''
@@ -127,6 +140,8 @@ def _deferred_path_curve_layer_sync():
         return None
     # A layer-list change is in flight — don't snap the layer back to an old curve
     if _pending_layer_to_curve_tree is not None:
+        return None
+    if time.time() < _layer_driven_sync_until:
         return None
     # Object may have been deleted between schedule and run
     try:
@@ -156,8 +171,10 @@ def sync_active_path_curve_layer_selection():
     global _last_path_curve_layer_sync, _pending_path_curve_layer_sync
     if _path_sel_sync_lock:
         return
-    # Don't fight an in-progress layer→curve sync (layer list click wins)
+    # Don't fight an in-progress / just-started layer→curve sync (layer list wins)
     if _pending_layer_to_curve_tree is not None:
+        return
+    if time.time() < _layer_driven_sync_until:
         return
     try:
         obj = bpy.context.object
@@ -198,48 +215,53 @@ def _deferred_layer_to_curve_sync():
     '''When a path/shape layer becomes active, select its curve (and vice versa leave).'''
     global _pending_layer_to_curve_tree, _pending_layer_to_curve_index
     global _last_path_curve_layer_sync, _path_sel_sync_lock
-    tree = _pending_layer_to_curve_tree
-    want_idx = _pending_layer_to_curve_index
-    _pending_layer_to_curve_tree = None
-    _pending_layer_to_curve_index = None
-    if not tree or _path_sel_sync_lock:
+    # Lock first so depsgraph curve→layer can't race while we clear pending
+    if _path_sel_sync_lock:
         return None
-    yp = getattr(tree, 'yp', None)
-    if not yp or getattr(yp, 'halt_update', False):
-        return None
-    if len(yp.layers) == 0 or yp.active_layer_index < 0 or yp.active_layer_index >= len(yp.layers):
-        return None
-    # Another layer click already superseded this deferred job
-    if want_idx is not None and int(yp.active_layer_index) != int(want_idx):
-        return None
-
-    layer = yp.layers[yp.active_layer_index]
-    curve_obj = None
-    if getattr(layer, 'enable_path_bake', False):
-        curve_obj = get_path_curve_object(layer)
-
-    try:
-        active = bpy.context.object
-    except Exception:
-        active = None
-
-    mesh = None
-    if curve_obj and curve_obj.parent and curve_obj.parent.type == 'MESH':
-        mesh = curve_obj.parent
-    elif active:
-        if active.type == 'MESH':
-            mesh = active
-        elif active.type == 'CURVE' and active.parent and active.parent.type == 'MESH':
-            mesh = active.parent
-
     _path_sel_sync_lock = True
     try:
+        tree = _pending_layer_to_curve_tree
+        want_idx = _pending_layer_to_curve_index
+        _pending_layer_to_curve_tree = None
+        _pending_layer_to_curve_index = None
+        if not tree:
+            return None
+        yp = getattr(tree, 'yp', None)
+        if not yp or getattr(yp, 'halt_update', False):
+            return None
+        if len(yp.layers) == 0 or yp.active_layer_index < 0 or yp.active_layer_index >= len(yp.layers):
+            return None
+        # Another layer click already superseded this deferred job
+        if want_idx is not None and int(yp.active_layer_index) != int(want_idx):
+            return None
+
+        layer = yp.layers[yp.active_layer_index]
+        curve_obj = None
+        if getattr(layer, 'enable_path_bake', False):
+            curve_obj = get_path_curve_object(layer)
+
+        try:
+            active = bpy.context.object
+        except Exception:
+            active = None
+
+        mesh = None
+        if curve_obj and curve_obj.parent and curve_obj.parent.type == 'MESH':
+            mesh = curve_obj.parent
+        elif active:
+            if active.type == 'MESH':
+                mesh = active
+            elif active.type == 'CURVE' and active.parent and active.parent.type == 'MESH':
+                mesh = active.parent
+
         if curve_obj:
-            if active != curve_obj:
-                _select_only_object(curve_obj)
+            # Mark the target curve as "already synced" before selecting it so a
+            # depsgraph event for the old curve can't yank the layer back.
             _last_path_curve_layer_sync = (
                 curve_obj.as_pointer() if hasattr(curve_obj, 'as_pointer') else curve_obj.name
             )
+            if active != curve_obj:
+                _select_only_object(curve_obj)
         else:
             # Left a path/shape layer: if a linked path curve is active, return to the mesh
             if active and active.type == 'CURVE':
@@ -255,6 +277,7 @@ def schedule_sync_active_layer_to_path_curve(yp):
     '''Defer layer→curve object selection (safe from active_layer_index update).'''
     global _pending_layer_to_curve_tree, _pending_layer_to_curve_index
     global _last_layer_to_curve_key, _pending_path_curve_layer_sync
+    global _layer_driven_sync_until
     if _path_sel_sync_lock or not yp:
         return
     if getattr(yp, 'halt_update', False):
@@ -269,9 +292,10 @@ def schedule_sync_active_layer_to_path_curve(yp):
     if key == _last_layer_to_curve_key:
         return
     _last_layer_to_curve_key = key
-    # Layer list click wins: cancel any stale curve→layer job still queued from
-    # the previously active path curve (that was the "snap back" bug).
+    # Layer list click wins: cancel any stale curve→layer job and ignore
+    # curve→layer depsgraph events until the new curve is selected.
     _pending_path_curve_layer_sync = None
+    _layer_driven_sync_until = time.time() + 0.35
     _pending_layer_to_curve_tree = tree
     _pending_layer_to_curve_index = int(yp.active_layer_index)
     if not bpy.app.timers.is_registered(_deferred_layer_to_curve_sync):

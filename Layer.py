@@ -694,12 +694,13 @@ class YNewVDMLayer(bpy.types.Operator):
 
     def invoke(self, context, event):
         ypup = get_user_preferences()
-        obj = context.object
+        obj = get_ypaint_ui_object(context.object) or context.object
         node = get_active_ypaint_node()
         yp = node.node_tree.yp
+        mat = get_active_material(obj)
 
         # Set default name
-        name = obj.active_material.name + DEFAULT_NEW_VDM_SUFFIX
+        name = (mat.name if mat else 'Image') + DEFAULT_NEW_VDM_SUFFIX
         self.name = get_unique_name(name, bpy.data.images)
 
         # Use user preference default image size
@@ -1188,13 +1189,14 @@ class YNewLayer(bpy.types.Operator):
         ypup = get_user_preferences()
         node = get_active_ypaint_node()
         yp = node.node_tree.yp
-        obj = context.object
+        obj = get_ypaint_ui_object(context.object) or context.object
+        mat = get_active_material(obj)
 
         if self.type == 'IMAGE':
-            name = obj.active_material.name + DEFAULT_NEW_IMG_SUFFIX
+            name = (mat.name if mat else 'Image') + DEFAULT_NEW_IMG_SUFFIX
             items = bpy.data.images
-        elif self.type == 'VCOL' and obj.type == 'MESH':
-            name = obj.active_material.name + DEFAULT_NEW_VCOL_SUFFIX
+        elif self.type == 'VCOL' and obj and obj.type == 'MESH':
+            name = (mat.name if mat else obj.name) + DEFAULT_NEW_VCOL_SUFFIX
             items = get_vertex_color_names(obj)
         else:
             name = layer_type_labels[self.type]
