@@ -406,7 +406,7 @@ def duplicate_path_curve_for_layer(layer, duplicated_curves=None):
         duplicated_curves[key] = new_curve
 
         # Keep shrinkwrap targeting the same mesh (parent / existing target)
-        if getattr(layer, 'path_enable_shrinkwrap', True):
+        if getattr(layer, 'path_enable_shrinkwrap', False):
             target = new_curve.parent
             if target and target.type == 'MESH':
                 _apply_layer_shrinkwrap(layer, new_curve, target)
@@ -579,7 +579,7 @@ def update_path_project_axis(self, context):
     if target and target.type == 'MESH':
         _apply_layer_shrinkwrap(self, curve_obj, target)
 
-def create_path_curve(target_obj, name='Path', use_shrinkwrap=True, cyclic=False,
+def create_path_curve(target_obj, name='Path', use_shrinkwrap=False, cyclic=False,
                       shrinkwrap_method='NEAREST_SURFACEPOINT',
                       project_axes=(False, False, False)):
     scene = bpy.context.scene
@@ -2876,7 +2876,7 @@ class BaseBakePath():
     path_enable_shrinkwrap : BoolProperty(
         name = 'Shrinkwrap to Mesh',
         description = 'Add a Shrinkwrap modifier on the path curve targeting the parent mesh',
-        default = True,
+        default = False,
         update = update_path_enable_shrinkwrap
     )
 
@@ -2912,7 +2912,7 @@ class BaseBakePath():
     path_project_view : BoolProperty(
         name = 'View',
         description = 'Bake along the 3D Viewport looking direction (ribbons project onto the mesh; shapes use it as the plane normal). The view is saved on bake and reused for Bake All / rebake',
-        default = False
+        default = True
     )
 
     path_view_saved : BoolProperty(
@@ -2971,13 +2971,13 @@ class BaseBakePath():
     path_width : FloatProperty(
         name = 'Path Width',
         description = 'Ribbon width in world units',
-        default = 0.05, min = 0.0001, max = 100.0, precision = 4, step = 1
+        default = 0.008, min = 0.0001, max = 100.0, precision = 4, step = 1
     )
 
     path_resolution : IntProperty(
         name = 'Path Resolution',
         description = 'How finely the curve itself is sampled — higher follows tight curvature more closely',
-        default = 512, min = 8, max = 4096
+        default = 128, min = 8, max = 4096
     )
 
     # Kept so older scenes keep loading; the bake no longer samples across width
@@ -3056,7 +3056,7 @@ class YNewPathLayer(bpy.types.Operator):
 
     path_width : FloatProperty(
         name = 'Path Width',
-        default = 0.05, min = 0.0001, max = 100.0, precision = 4
+        default = 0.008, min = 0.0001, max = 100.0, precision = 4
     )
 
     hdr : BoolProperty(name='32-bit Float', default=False)
@@ -3083,9 +3083,8 @@ class YNewPathLayer(bpy.types.Operator):
         elif len(yp.uvs) > 0:
             self.uv_map = yp.uvs[0].name
 
-        # Guess a reasonable default width from object size
-        dim = max(obj.dimensions) if obj.dimensions.length > 0 else 1.0
-        self.path_width = max(dim * 0.02, 0.01)
+        # Default ribbon width (matches layer.path_width)
+        self.path_width = 0.008
 
         return context.window_manager.invoke_props_dialog(self, width=320)
 
@@ -3145,8 +3144,7 @@ class YNewPathLayer(bpy.types.Operator):
         is_shape = self.path_mode == 'SHAPE'
         curve_label = self.name + (' Shape' if is_shape else ' Curve')
         curve_obj = create_path_curve(
-            obj, name=curve_label, use_shrinkwrap=True, cyclic=is_shape,
-            shrinkwrap_method='NEAREST_SURFACEPOINT'
+            obj, name=curve_label, use_shrinkwrap=False, cyclic=is_shape
         )
 
         from . import Layer
@@ -3163,11 +3161,10 @@ class YNewPathLayer(bpy.types.Operator):
 
         layer.enable_path_bake = True
         layer.path_mode = self.path_mode
-        layer.path_enable_shrinkwrap = True
-        layer.path_shrinkwrap_method = 'NEAREST_SURFACEPOINT'
+        layer.path_enable_shrinkwrap = False
+        layer.path_project_view = True
         set_path_curve_object(layer, curve_obj)
         layer.path_width = self.path_width
-        _apply_layer_shrinkwrap(layer, curve_obj, obj)
         if is_shape:
             ensure_curve_cyclic(curve_obj, True)
 
@@ -3185,20 +3182,8 @@ class YNewPathLayer(bpy.types.Operator):
         ypui.need_update = True
         ListItem.refresh_list_items(yp)
 
-        # Initial bake so something is visible immediately
-        ok, msg = bake_path_to_image(
-            obj, img, curve_obj, self.uv_map,
-            width=layer.path_width,
-            resolution=layer.path_resolution,
-            width_samples=layer.path_width_samples,
-            color=tuple(layer.path_color),
-            falloff=layer.path_falloff,
-            clear=True,
-            mode=layer.path_mode,
-            feather_px=layer.path_shape_feather,
-            shrinkwrap_method=_layer_shrinkwrap_method(layer),
-            project_axes=_layer_project_axes(layer),
-        )
+        # Initial bake (View projection, no shrinkwrap)
+        ok, msg = bake_layer_path(obj, layer, context=context, capture_view=True)
         kind = 'Shape' if is_shape else 'Path'
         if not ok:
             self.report({'WARNING'}, '%s layer created, but initial bake skipped: %s' % (kind, msg))
@@ -3284,7 +3269,7 @@ def bake_layer_path(obj, layer, context=None, capture_view=False, mesh_cache=Non
     if view_err:
         return False, view_err
 
-    if getattr(layer, 'path_enable_shrinkwrap', True):
+    if getattr(layer, 'path_enable_shrinkwrap', False):
         _apply_layer_shrinkwrap(layer, curve_obj, obj)
 
     ok, msg = bake_path_to_image(

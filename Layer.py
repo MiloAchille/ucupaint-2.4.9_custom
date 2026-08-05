@@ -372,6 +372,8 @@ def add_new_layer(
 
         if root_ch.type == 'NORMAL':
             ch.normal_map_type = normal_map_type
+            # Softer default for normal/bump blend strength
+            ch.intensity_value = 0.5
             
             # Background layer has default bump distance of 0.0
             if layer.type in {'BACKGROUND'}:
@@ -7044,7 +7046,7 @@ class YLayerChannel(bpy.types.PropertyGroup):
     bump_distance : FloatProperty(
         name = 'Bump Height Range', 
         description = 'Bump height range.\n(White equals this value, black equals negative of this value)', 
-        default=0.05, min=-1.0, max=1.0, precision=3
+        default=0.025, min=-1.0, max=1.0, precision=3
     )
 
     bump_midlevel : FloatProperty(
