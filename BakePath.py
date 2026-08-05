@@ -1983,20 +1983,66 @@ def _get_viewport_view_direction(context=None):
         return None
     return state['direction']
 
-def layer_has_saved_path_view(layer):
-    return bool(getattr(layer, 'path_view_saved', False))
-
-def get_layer_saved_view_direction(layer):
-    '''Return saved bake view direction, or None.'''
-    if not layer_has_saved_path_view(layer):
-        return None
-    d = Vector(getattr(layer, 'path_view_direction', (0.0, 0.0, -1.0)))
+def _view_direction_world_to_mesh_local(direction_world, mesh_obj):
+    '''Express a world-space look direction in the mesh object's local space.'''
+    d = Vector(direction_world)
     if d.length < 1e-8:
         return None
     d.normalize()
+    if not mesh_obj:
+        return d
+    try:
+        local = mesh_obj.matrix_world.to_3x3().inverted_safe() @ d
+    except Exception:
+        return d
+    if local.length < 1e-8:
+        return d
+    local.normalize()
+    return local
+
+def _view_direction_mesh_local_to_world(direction_local, mesh_obj):
+    '''Convert a mesh-local look direction back to world space.'''
+    d = Vector(direction_local)
+    if d.length < 1e-8:
+        return None
+    d.normalize()
+    if not mesh_obj:
+        return d
+    try:
+        world = mesh_obj.matrix_world.to_3x3() @ d
+    except Exception:
+        return d
+    if world.length < 1e-8:
+        return d
+    world.normalize()
+    return world
+
+def layer_has_saved_path_view(layer):
+    return bool(getattr(layer, 'path_view_saved', False))
+
+def get_layer_saved_view_direction(layer, mesh_obj=None):
+    '''
+    Return saved bake view direction in world space, or None.
+    New saves store the direction in mesh-local space so rebakes stay correct
+    after moving/rotating the model (common around re-unwrap workflows).
+    '''
+    if not layer_has_saved_path_view(layer):
+        return None
+    raw = getattr(layer, 'path_view_direction', (0.0, 0.0, -1.0))
+    try:
+        d = Vector((float(raw[0]), float(raw[1]), float(raw[2])))
+    except Exception:
+        return None
+    if d.length < 1e-8:
+        return None
+    d.normalize()
+
+    if getattr(layer, 'path_view_mesh_local', False):
+        return _view_direction_mesh_local_to_world(d, mesh_obj)
+    # Legacy: direction was stored in world space
     return d
 
-def save_layer_path_view(layer, context=None, state=None):
+def save_layer_path_view(layer, context=None, state=None, mesh_obj=None):
     '''Store the current (or provided) viewport state on the layer for later rebakes.'''
     if state is None:
         state = _get_viewport_view_state(context)
@@ -2006,8 +2052,18 @@ def save_layer_path_view(layer, context=None, state=None):
     rotation = state['rotation']
     location = state['location']
     distance = state['distance']
-    layer.path_view_direction = (float(direction.x), float(direction.y), float(direction.z))
-    # Quaternion: Blender stores (w, x, y, z)
+
+    # Prefer mesh-local so object transforms after re-unwrap don't skew projection
+    local = _view_direction_world_to_mesh_local(direction, mesh_obj)
+    if local is None:
+        local = Vector(direction)
+        local.normalize()
+        layer.path_view_mesh_local = False
+    else:
+        layer.path_view_mesh_local = bool(mesh_obj is not None)
+
+    layer.path_view_direction = (float(local.x), float(local.y), float(local.z))
+    # Quaternion: Blender stores (w, x, y, z) — kept in world space for "Go to View"
     layer.path_view_rotation = (
         float(rotation.w), float(rotation.x), float(rotation.y), float(rotation.z)
     )
@@ -2020,7 +2076,7 @@ def clear_layer_path_view(layer):
     layer.path_view_saved = False
 
 def apply_layer_saved_view_to_viewport(layer, context=None):
-    '''Restore the 3D Viewport to the layer's saved bake view. Returns True on success.'''
+    '''Restore the 3D Viewport to this layer's saved bake view. Returns True on success.'''
     if not layer_has_saved_path_view(layer):
         return False
     _space, rv3d = _find_viewport_region_3d(context)
@@ -2040,37 +2096,42 @@ def apply_layer_saved_view_to_viewport(layer, context=None):
         return False
     return True
 
-def resolve_path_bake_view_direction(layer, context=None, capture_view=False):
+def resolve_path_bake_view_direction(layer, context=None, capture_view=False, mesh_obj=None):
     '''
-    Direction for Project Axis → View.
-    - capture_view=True (single-layer Bake): use live viewport and save it.
-    - capture_view=False (Bake All / rebake): prefer saved view, else live viewport (and save).
-    Returns (direction Vector or None, error_message or None).
+    Direction for Project Axis → View (always returned in world space).
+
+    - capture_view=True (single-layer Bake / Capture): use live viewport and save it
+      in mesh-local space.
+    - capture_view=False (Bake All / rebake): prefer the saved view. If missing, use
+      the live viewport for this bake only — do NOT overwrite the saved view (a UV
+      Editing workspace often has a useless leftover 3D View angle).
     '''
     if not getattr(layer, 'path_project_view', False):
         return None, None
 
     if not capture_view:
-        saved = get_layer_saved_view_direction(layer)
+        saved = get_layer_saved_view_direction(layer, mesh_obj=mesh_obj)
         if saved is not None:
             return saved, None
 
     state = _get_viewport_view_state(context)
     if state is None:
-        if layer_has_saved_path_view(layer):
-            # Viewport missing but we still have a saved direction
-            saved = get_layer_saved_view_direction(layer)
-            if saved is not None:
-                return saved, None
+        saved = get_layer_saved_view_direction(layer, mesh_obj=mesh_obj)
+        if saved is not None:
+            return saved, None
         return None, "No 3D Viewport found — open a 3D View or turn off Project Axis 'View'"
 
-    save_layer_path_view(layer, state=state)
+    # Only persist when the user intentionally captures (single bake / Capture button)
+    if capture_view:
+        save_layer_path_view(layer, state=state, mesh_obj=mesh_obj)
+
     return state['direction'], None
 
 def _project_polyline_along_direction(points, bvh, direction, max_dist):
     '''
     Project each point onto the mesh along +/- direction (Shrinkwrap Project style).
-    Picks the hit closest to the original point. Misses keep the original.
+    Picks the hit closest to the original point. Ray misses fall back to nearest
+    surface so a slightly stale saved view still tracks the curve.
     '''
     if not points or bvh is None:
         return list(points) if points else []
@@ -2079,6 +2140,7 @@ def _project_polyline_along_direction(points, bvh, direction, max_dist):
         return [Vector(p) for p in points]
     d.normalize()
     reach = max(float(max_dist), 1e-4)
+    nearest_limit = reach
     out = []
     for p in points:
         p = Vector(p)
@@ -2099,6 +2161,13 @@ def _project_polyline_along_direction(points, bvh, direction, max_dist):
             if best is None or gap < best_gap:
                 best = loc
                 best_gap = gap
+        if best is None:
+            try:
+                near = bvh.find_nearest(p)
+            except Exception:
+                near = None
+            if near and near[0] is not None and float(near[3]) <= nearest_limit:
+                best = Vector(near[0])
         out.append(best if best is not None else p)
     return out
 
@@ -2797,7 +2866,7 @@ class BaseBakePath():
 
     path_view_direction : FloatVectorProperty(
         name = 'Saved View Direction',
-        description = 'World-space look direction used for View projection baking',
+        description = 'Look direction for View projection baking (mesh-local when path_view_mesh_local is set)',
         size = 3,
         default = (0.0, 0.0, -1.0)
     )
@@ -2821,6 +2890,12 @@ class BaseBakePath():
         description = 'Viewport distance for restoring the bake view',
         default = 10.0,
         min = 0.0001
+    )
+
+    path_view_mesh_local : BoolProperty(
+        name = 'Saved View Is Mesh-Local',
+        description = 'If set, path_view_direction is stored in the bake mesh local space (stable across object transforms / re-unwrap workflows)',
+        default = False
     )
 
     if is_bl_newer_than(2, 79):
@@ -3147,7 +3222,7 @@ def bake_layer_path(obj, layer, context=None, capture_view=False):
     method = _layer_shrinkwrap_method(layer)
     axes = _layer_project_axes(layer)
     project_normal, view_err = resolve_path_bake_view_direction(
-        layer, context=context, capture_view=capture_view
+        layer, context=context, capture_view=capture_view, mesh_obj=obj
     )
     if view_err:
         return False, view_err
@@ -3725,7 +3800,8 @@ class YCapturePathBakeView(bpy.types.Operator):
             self.report({'ERROR'}, 'No path/shape layer')
             return {'CANCELLED'}
 
-        if not save_layer_path_view(layer, context=context):
+        mesh_obj = resolve_path_bake_mesh(context.object)
+        if not save_layer_path_view(layer, context=context, mesh_obj=mesh_obj):
             self.report({'ERROR'}, 'No 3D Viewport found to capture')
             return {'CANCELLED'}
 
