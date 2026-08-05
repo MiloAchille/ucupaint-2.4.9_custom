@@ -1862,18 +1862,13 @@ def _world_project_normal(curve_obj, project_axes, fallback_obj=None):
     normal.normalize()
     return normal
 
-def _get_viewport_view_direction(context=None):
-    '''
-    World-space direction the active 3D Viewport is looking (into the screen).
-    Used when baking with Project Axis → View.
-    '''
+def _find_viewport_region_3d(context=None):
+    '''Return (space, region_3d) for the active / first 3D Viewport, or (None, None).'''
     ctx = context if context is not None else bpy.context
     rv3d = getattr(ctx, 'region_data', None)
     if rv3d is not None:
-        direction = rv3d.view_rotation @ Vector((0.0, 0.0, -1.0))
-        if direction.length > 1e-8:
-            direction.normalize()
-            return direction
+        space = getattr(ctx, 'space_data', None)
+        return space, rv3d
 
     screen = getattr(ctx, 'screen', None)
     if screen is None:
@@ -1887,7 +1882,7 @@ def _get_viewport_view_direction(context=None):
                     screen = window.screen
                     break
     if screen is None:
-        return None
+        return None, None
 
     for area in screen.areas:
         if area.type != 'VIEW_3D':
@@ -1896,13 +1891,134 @@ def _get_viewport_view_direction(context=None):
         if space is None and len(area.spaces) > 0:
             space = area.spaces[0]
         rv3d = getattr(space, 'region_3d', None) if space else None
-        if rv3d is None:
-            continue
-        direction = rv3d.view_rotation @ Vector((0.0, 0.0, -1.0))
-        if direction.length > 1e-8:
-            direction.normalize()
-            return direction
-    return None
+        if rv3d is not None:
+            return space, rv3d
+    return None, None
+
+def _get_viewport_view_state(context=None):
+    '''
+    Capture the active 3D Viewport look: direction, rotation, orbit center, distance.
+    Returns a dict or None.
+    '''
+    _space, rv3d = _find_viewport_region_3d(context)
+    if rv3d is None:
+        return None
+    try:
+        rotation = rv3d.view_rotation.copy()
+    except Exception:
+        return None
+    direction = rotation @ Vector((0.0, 0.0, -1.0))
+    if direction.length < 1e-8:
+        return None
+    direction.normalize()
+    try:
+        location = rv3d.view_location.copy()
+    except Exception:
+        location = Vector((0.0, 0.0, 0.0))
+    try:
+        distance = float(rv3d.view_distance)
+    except Exception:
+        distance = 10.0
+    return {
+        'direction': direction,
+        'rotation': rotation,
+        'location': location,
+        'distance': distance,
+    }
+
+def _get_viewport_view_direction(context=None):
+    '''
+    World-space direction the active 3D Viewport is looking (into the screen).
+    Used when baking with Project Axis → View.
+    '''
+    state = _get_viewport_view_state(context)
+    if state is None:
+        return None
+    return state['direction']
+
+def layer_has_saved_path_view(layer):
+    return bool(getattr(layer, 'path_view_saved', False))
+
+def get_layer_saved_view_direction(layer):
+    '''Return saved bake view direction, or None.'''
+    if not layer_has_saved_path_view(layer):
+        return None
+    d = Vector(getattr(layer, 'path_view_direction', (0.0, 0.0, -1.0)))
+    if d.length < 1e-8:
+        return None
+    d.normalize()
+    return d
+
+def save_layer_path_view(layer, context=None, state=None):
+    '''Store the current (or provided) viewport state on the layer for later rebakes.'''
+    if state is None:
+        state = _get_viewport_view_state(context)
+    if state is None:
+        return False
+    direction = state['direction']
+    rotation = state['rotation']
+    location = state['location']
+    distance = state['distance']
+    layer.path_view_direction = (float(direction.x), float(direction.y), float(direction.z))
+    # Quaternion: Blender stores (w, x, y, z)
+    layer.path_view_rotation = (
+        float(rotation.w), float(rotation.x), float(rotation.y), float(rotation.z)
+    )
+    layer.path_view_location = (float(location.x), float(location.y), float(location.z))
+    layer.path_view_distance = max(float(distance), 1e-4)
+    layer.path_view_saved = True
+    return True
+
+def clear_layer_path_view(layer):
+    layer.path_view_saved = False
+
+def apply_layer_saved_view_to_viewport(layer, context=None):
+    '''Restore the 3D Viewport to the layer's saved bake view. Returns True on success.'''
+    if not layer_has_saved_path_view(layer):
+        return False
+    _space, rv3d = _find_viewport_region_3d(context)
+    if rv3d is None:
+        return False
+    from mathutils import Quaternion
+    rot = getattr(layer, 'path_view_rotation', (1.0, 0.0, 0.0, 0.0))
+    loc = getattr(layer, 'path_view_location', (0.0, 0.0, 0.0))
+    dist = float(getattr(layer, 'path_view_distance', 10.0))
+    try:
+        rv3d.view_rotation = Quaternion((rot[0], rot[1], rot[2], rot[3]))
+        rv3d.view_location = Vector((loc[0], loc[1], loc[2]))
+        rv3d.view_distance = max(dist, 1e-4)
+        if hasattr(rv3d, 'update'):
+            rv3d.update()
+    except Exception:
+        return False
+    return True
+
+def resolve_path_bake_view_direction(layer, context=None, capture_view=False):
+    '''
+    Direction for Project Axis → View.
+    - capture_view=True (single-layer Bake): use live viewport and save it.
+    - capture_view=False (Bake All / rebake): prefer saved view, else live viewport (and save).
+    Returns (direction Vector or None, error_message or None).
+    '''
+    if not getattr(layer, 'path_project_view', False):
+        return None, None
+
+    if not capture_view:
+        saved = get_layer_saved_view_direction(layer)
+        if saved is not None:
+            return saved, None
+
+    state = _get_viewport_view_state(context)
+    if state is None:
+        if layer_has_saved_path_view(layer):
+            # Viewport missing but we still have a saved direction
+            saved = get_layer_saved_view_direction(layer)
+            if saved is not None:
+                return saved, None
+        return None, "No 3D Viewport found — open a 3D View or turn off Project Axis 'View'"
+
+    save_layer_path_view(layer, state=state)
+    return state['direction'], None
 
 def _project_polyline_along_direction(points, bvh, direction, max_dist):
     '''
@@ -2622,8 +2738,42 @@ class BaseBakePath():
     )
     path_project_view : BoolProperty(
         name = 'View',
-        description = 'Bake using the current 3D Viewport looking direction (ribbons project onto the mesh along the view; shapes use it as the plane normal). Captured at bake time',
+        description = 'Bake along the 3D Viewport looking direction (ribbons project onto the mesh; shapes use it as the plane normal). The view is saved on bake and reused for Bake All / rebake',
         default = False
+    )
+
+    path_view_saved : BoolProperty(
+        name = 'Has Saved Bake View',
+        description = 'Whether this layer stored a viewport for View projection rebakes',
+        default = False
+    )
+
+    path_view_direction : FloatVectorProperty(
+        name = 'Saved View Direction',
+        description = 'World-space look direction used for View projection baking',
+        size = 3,
+        default = (0.0, 0.0, -1.0)
+    )
+
+    path_view_rotation : FloatVectorProperty(
+        name = 'Saved View Rotation',
+        description = 'Viewport rotation (quaternion wxyz) for restoring the bake view',
+        size = 4,
+        default = (1.0, 0.0, 0.0, 0.0)
+    )
+
+    path_view_location : FloatVectorProperty(
+        name = 'Saved View Location',
+        description = 'Viewport orbit center for restoring the bake view',
+        size = 3,
+        default = (0.0, 0.0, 0.0)
+    )
+
+    path_view_distance : FloatProperty(
+        name = 'Saved View Distance',
+        description = 'Viewport distance for restoring the bake view',
+        default = 10.0,
+        min = 0.0001
     )
 
     if is_bl_newer_than(2, 79):
@@ -2912,7 +3062,7 @@ class YBakePathToLayer(bpy.types.Operator):
             return {'CANCELLED'}
 
         T = time.time()
-        ok, msg = bake_layer_path(obj, layer, context=context)
+        ok, msg = bake_layer_path(obj, layer, context=context, capture_view=True)
 
         if not ok:
             self.report({'ERROR'}, msg)
@@ -2924,8 +3074,14 @@ class YBakePathToLayer(bpy.types.Operator):
         self.report({'INFO'}, msg + ' ({:0.0f} ms)'.format((time.time() - T) * 1000))
         return {'FINISHED'}
 
-def bake_layer_path(obj, layer, context=None):
-    '''Bake one path/shape layer. Returns (ok, message).'''
+def bake_layer_path(obj, layer, context=None, capture_view=False):
+    '''
+    Bake one path/shape layer. Returns (ok, message).
+
+    capture_view: when Project Axis → View is on, True reads the live viewport
+    and stores it on the layer (single Bake Path/Shape). False prefers the
+    saved view so Bake All / rebake stay consistent after you move the camera.
+    '''
     curve_obj = get_path_curve_object(layer)
     if not curve_obj:
         return False, "Layer '%s' has no path curve" % layer.name
@@ -2943,11 +3099,11 @@ def bake_layer_path(obj, layer, context=None):
 
     method = _layer_shrinkwrap_method(layer)
     axes = _layer_project_axes(layer)
-    project_normal = None
-    if getattr(layer, 'path_project_view', False):
-        project_normal = _get_viewport_view_direction(context)
-        if project_normal is None:
-            return False, "No 3D Viewport found — open a 3D View or turn off Project Axis 'View'"
+    project_normal, view_err = resolve_path_bake_view_direction(
+        layer, context=context, capture_view=capture_view
+    )
+    if view_err:
+        return False, view_err
 
     if getattr(layer, 'path_enable_shrinkwrap', True):
         _apply_layer_shrinkwrap(layer, curve_obj, obj)
@@ -2971,6 +3127,11 @@ def bake_layer_path(obj, layer, context=None):
     )
     if ok:
         image.update()
+        if project_normal is not None:
+            if capture_view:
+                msg += ' [view captured]'
+            elif layer_has_saved_path_view(layer):
+                msg += ' [saved view]'
     return ok, msg
 
 def iter_bakeable_path_layers(yp):
@@ -3493,6 +3654,98 @@ class YUsePathBakeAsMask(bpy.types.Operator):
         )
         return {'FINISHED'}
 
+class YCapturePathBakeView(bpy.types.Operator):
+    '''Store the current 3D Viewport as this layer's bake view (used by Bake All / rebake)'''
+    bl_idname = 'wm.y_capture_path_bake_view'
+    bl_label = 'Capture Bake View'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        layer = getattr(context, 'layer', None)
+        if not layer:
+            node = get_active_ypaint_node()
+            if node:
+                layer = get_active_layer(node.node_tree.yp)
+        return layer is not None and getattr(layer, 'enable_path_bake', False)
+
+    def execute(self, context):
+        layer = getattr(context, 'layer', None)
+        if not layer:
+            node = get_active_ypaint_node()
+            layer = get_active_layer(node.node_tree.yp) if node else None
+        if not layer:
+            self.report({'ERROR'}, 'No path/shape layer')
+            return {'CANCELLED'}
+
+        if not save_layer_path_view(layer, context=context):
+            self.report({'ERROR'}, 'No 3D Viewport found to capture')
+            return {'CANCELLED'}
+
+        # Enable View so the saved direction is actually used
+        if not layer.path_project_view:
+            layer.path_project_view = True
+
+        self.report({'INFO'}, "Saved bake view for '%s'" % layer.name)
+        return {'FINISHED'}
+
+class YClearPathBakeView(bpy.types.Operator):
+    '''Forget the saved bake view for this layer'''
+    bl_idname = 'wm.y_clear_path_bake_view'
+    bl_label = 'Clear Bake View'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        layer = getattr(context, 'layer', None)
+        if not layer:
+            node = get_active_ypaint_node()
+            if node:
+                layer = get_active_layer(node.node_tree.yp)
+        return layer is not None and layer_has_saved_path_view(layer)
+
+    def execute(self, context):
+        layer = getattr(context, 'layer', None)
+        if not layer:
+            node = get_active_ypaint_node()
+            layer = get_active_layer(node.node_tree.yp) if node else None
+        if not layer:
+            return {'CANCELLED'}
+        clear_layer_path_view(layer)
+        self.report({'INFO'}, "Cleared saved bake view for '%s'" % layer.name)
+        return {'FINISHED'}
+
+class YGotoPathBakeView(bpy.types.Operator):
+    '''Move the 3D Viewport to this layer's saved bake view'''
+    bl_idname = 'wm.y_goto_path_bake_view'
+    bl_label = 'Go to Bake View'
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        layer = getattr(context, 'layer', None)
+        if not layer:
+            node = get_active_ypaint_node()
+            if node:
+                layer = get_active_layer(node.node_tree.yp)
+        return layer is not None and layer_has_saved_path_view(layer)
+
+    def execute(self, context):
+        layer = getattr(context, 'layer', None)
+        if not layer:
+            node = get_active_ypaint_node()
+            layer = get_active_layer(node.node_tree.yp) if node else None
+        if not layer:
+            return {'CANCELLED'}
+        if not apply_layer_saved_view_to_viewport(layer, context=context):
+            self.report({'ERROR'}, 'Could not restore bake view (no 3D Viewport?)')
+            return {'CANCELLED'}
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+        self.report({'INFO'}, "Viewport set to saved bake view for '%s'" % layer.name)
+        return {'FINISHED'}
+
 def draw_path_bake_ui(layout, context, layer):
     '''Draw Path Bake controls for an IMAGE layer.'''
     if layer.type != 'IMAGE':
@@ -3548,6 +3801,18 @@ def draw_path_bake_ui(layout, context, layer):
     axes.prop(layer, 'path_project_y', text='Y', toggle=True)
     axes.prop(layer, 'path_project_z', text='Z', toggle=True)
     axis_row.prop(layer, 'path_project_view', text='View', toggle=True)
+
+    if layer.path_project_view:
+        view_row = col.row(align=True)
+        view_row.context_pointer_set('layer', layer)
+        if layer_has_saved_path_view(layer):
+            view_row.label(text='Bake view saved', icon='SOLO_ON')
+            view_row.operator('wm.y_goto_path_bake_view', text='', icon='VIEWZOOM' if is_bl_newer_than(2, 80) else 'ZOOM_SELECTED')
+            view_row.operator('wm.y_capture_path_bake_view', text='', icon='FILE_REFRESH')
+            view_row.operator('wm.y_clear_path_bake_view', text='', icon='X')
+        else:
+            view_row.label(text='No saved view yet')
+            view_row.operator('wm.y_capture_path_bake_view', text='Capture View', icon='CAMERA_DATA')
 
     col.separator()
     # Bake image resolution (Layer Source Info is read-only for FILE images)
@@ -3619,6 +3884,9 @@ def register():
     bpy.utils.register_class(YSelectPathCurve)
     bpy.utils.register_class(YCreatePathCurveForLayer)
     bpy.utils.register_class(YUsePathBakeAsMask)
+    bpy.utils.register_class(YCapturePathBakeView)
+    bpy.utils.register_class(YClearPathBakeView)
+    bpy.utils.register_class(YGotoPathBakeView)
 
 def unregister():
     bpy.utils.unregister_class(YNewPathLayer)
@@ -3628,3 +3896,6 @@ def unregister():
     bpy.utils.unregister_class(YSelectPathCurve)
     bpy.utils.unregister_class(YCreatePathCurveForLayer)
     bpy.utils.unregister_class(YUsePathBakeAsMask)
+    bpy.utils.unregister_class(YCapturePathBakeView)
+    bpy.utils.unregister_class(YClearPathBakeView)
+    bpy.utils.unregister_class(YGotoPathBakeView)
