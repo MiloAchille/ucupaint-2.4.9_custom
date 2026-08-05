@@ -946,8 +946,23 @@ def _resample_polyline(points, count):
             result.append(points[j - 1].lerp(points[j], t))
     return result
 
+def _mesh_bake_cache_key(obj, uv_name):
+    '''Stable key so Bake All can reuse one triangulated mesh BVH.'''
+    mesh = obj.data
+    return (
+        obj.as_pointer(),
+        mesh.as_pointer(),
+        uv_name,
+        len(mesh.vertices),
+        len(mesh.loops),
+        len(mesh.polygons),
+    )
+
 def _build_mesh_bvh_and_uvs(obj, uv_name):
-    '''Build world-space BVH and per-loop UV data for UV interpolation.'''
+    '''
+    Build world-space BVH plus triangle arrays for baking.
+    Returns (bvh, verts (T,3,3), uvs (T,3,2), nrms (T,3)) or Nones.
+    '''
     mesh = obj.data
     uv_layer = mesh.uv_layers.get(uv_name) if hasattr(mesh, 'uv_layers') else None
     if not uv_layer and hasattr(mesh, 'uv_layers') and len(mesh.uv_layers) > 0:
@@ -956,13 +971,8 @@ def _build_mesh_bvh_and_uvs(obj, uv_name):
         return None, None, None, None
 
     mw = obj.matrix_world
-    # Normal matrix for transforming normals
-    try:
-        normal_mw = mw.to_3x3().inverted_safe().transposed()
-    except Exception:
-        normal_mw = mw.to_3x3()
 
-    # Triangulate via bmesh for stable face indices
+    # Triangulate via bmesh for stable face indices matching the BVH
     import bmesh
     bm = bmesh.new()
     bm.from_mesh(mesh)
@@ -978,38 +988,66 @@ def _build_mesh_bvh_and_uvs(obj, uv_name):
 
     bvh = BVHTree.FromBMesh(bm)
 
-    # Store triangle verts + uvs for barycentric UV lookup
-    tris = []  # list of (v0, v1, v2, uv0, uv1, uv2, normal)
+    # Flat float buffers → numpy (avoid a giant list of mathutils Vectors)
+    v_flat = []
+    uv_flat = []
+    n_flat = []
     for face in bm.faces:
         if len(face.loops) != 3:
             continue
-        verts = [loop.vert.co.copy() for loop in face.loops]
-        uvs = [loop[uv_lay].uv.copy() for loop in face.loops]
-        tris.append((verts[0], verts[1], verts[2], uvs[0], uvs[1], uvs[2], face.normal.copy()))
+        for loop in face.loops:
+            c = loop.vert.co
+            v_flat.extend((c.x, c.y, c.z))
+            u = loop[uv_lay].uv
+            uv_flat.extend((u.x, u.y))
+        n = face.normal
+        n_flat.extend((n.x, n.y, n.z))
 
-    # Keep bm for now? Free after building arrays — BVH owns its data
     bm.free()
 
-    return bvh, tris, mw, normal_mw
+    if not v_flat:
+        return None, None, None, None
 
-def _nearest_uv(bvh, tris, point, max_dist=None):
+    verts = numpy.asarray(v_flat, dtype=numpy.float32).reshape(-1, 3, 3)
+    uvs = numpy.asarray(uv_flat, dtype=numpy.float32).reshape(-1, 3, 2)
+    nrms = numpy.asarray(n_flat, dtype=numpy.float32).reshape(-1, 3)
+    lens = numpy.linalg.norm(nrms, axis=1)
+    lens[lens < 1e-12] = 1.0
+    nrms /= lens[:, None]
+    return bvh, verts, uvs, nrms
+
+def _get_mesh_bake_geometry(obj, uv_name, mesh_cache=None):
+    '''Return (bvh, verts, uvs, nrms), optionally reusing a Bake All cache.'''
+    key = _mesh_bake_cache_key(obj, uv_name)
+    if mesh_cache is not None and key in mesh_cache:
+        return mesh_cache[key]
+    geom = _build_mesh_bvh_and_uvs(obj, uv_name)
+    if mesh_cache is not None and geom[0] is not None:
+        mesh_cache[key] = geom
+    return geom
+
+def _nearest_uv(bvh, verts, uvs, nrms, point, max_dist=None):
     hit = bvh.find_nearest(point)
     if hit is None or hit[0] is None:
         return None
     loc, normal, index, dist = hit
     if max_dist is not None and dist > max_dist:
         return None
-    if index < 0 or index >= len(tris):
+    if index < 0 or index >= verts.shape[0]:
         return None
 
-    v0, v1, v2, uv0, uv1, uv2, face_n = tris[index]
-    # Barycentric UV
+    v0 = Vector(verts[index, 0])
+    v1 = Vector(verts[index, 1])
+    v2 = Vector(verts[index, 2])
+    uv0 = Vector((float(uvs[index, 0, 0]), float(uvs[index, 0, 1])))
+    uv1 = Vector((float(uvs[index, 1, 0]), float(uvs[index, 1, 1])))
+    uv2 = Vector((float(uvs[index, 2, 0]), float(uvs[index, 2, 1])))
     try:
-        # Use 2D barycentric in the triangle plane via areas
         uv = _barycentric_uv(loc, v0, v1, v2, uv0, uv1, uv2)
     except Exception:
         uv = (uv0 + uv1 + uv2) / 3.0
 
+    face_n = Vector(nrms[index])
     n = face_n if face_n.length > 1e-8 else Vector(normal)
     if n.length > 1e-8:
         n.normalize()
@@ -1046,7 +1084,10 @@ def _barycentric_uv(p, a, b, c, uva, uvb, uvc):
 # ---------------------------------------------------------------------------
 
 _MAX_SURFACE_TEXELS = 8000000
-_OCCLUSION_TEST_LIMIT = 60000
+# Pure-Python BVH raycasts dominate bake time — subsample beyond this.
+_OCCLUSION_TEST_LIMIT = 4000
+# Plane silhouette does not need multi-million cell grids; bilinear sampling keeps edges.
+_SHAPE_PLANE_MAX_CELLS = 1024 * 1024
 
 def _falloff_profile(dist, half_width, power=1.0):
     '''Cross-section opacity: 1 at the center, 0 at the edge.'''
@@ -1232,24 +1273,6 @@ def _seal_uv_seams_shape(coverage, seam_pairs, mask_sample, origin, u_axis, v_ax
         v1 = 0.5 * (float(ua1[1]) + float(ub1[1]))
         _splat_coverage_uv_segment(coverage, u0, v0, u0, v0, alpha, radius_px)
         _splat_coverage_uv_segment(coverage, u1, v1, u1, v1, alpha, radius_px)
-
-def _tris_to_arrays(tris):
-    '''Triangle soup as arrays: verts (T,3,3), uvs (T,3,2), unit normals (T,3).'''
-    verts = numpy.array(
-        [[[t[0].x, t[0].y, t[0].z],
-          [t[1].x, t[1].y, t[1].z],
-          [t[2].x, t[2].y, t[2].z]] for t in tris],
-        dtype=numpy.float32
-    )
-    uvs = numpy.array(
-        [[[t[3].x, t[3].y], [t[4].x, t[4].y], [t[5].x, t[5].y]] for t in tris],
-        dtype=numpy.float32
-    )
-    nrms = numpy.array([[t[6].x, t[6].y, t[6].z] for t in tris], dtype=numpy.float32)
-    lens = numpy.linalg.norm(nrms, axis=1)
-    lens[lens < 1e-12] = 1.0
-    nrms /= lens[:, None]
-    return verts, uvs, nrms
 
 def _tris_near_points(bvh, tri_count, points, radius):
     '''Triangle indices within radius of any point (None if BVH lacks range query).'''
@@ -1451,7 +1474,7 @@ def _polyline_to_segments(points, cyclic):
     ]).astype(numpy.float32)
     return start, delta, delta2, length, arc_start, float(length.sum())
 
-def _sample_surface_gap_normals(bvh, tris, polyline, far_away, max_samples=256):
+def _sample_surface_gap_normals(bvh, verts, uvs, nrms, polyline, far_away, max_samples=256):
     '''
     Surface normal + gap under each curve sample.
     Dense polylines are thinned first so BVH queries stay cheap; results are
@@ -1469,7 +1492,7 @@ def _sample_surface_gap_normals(bvh, tris, polyline, far_away, max_samples=256):
     q_nrm = numpy.empty((q_n, 3), dtype=numpy.float32)
     q_gap = numpy.empty(q_n, dtype=numpy.float32)
     for i, p in enumerate(query):
-        hit = _nearest_uv(bvh, tris, p)
+        hit = _nearest_uv(bvh, verts, uvs, nrms, p)
         if hit:
             n = hit[1]
             q_nrm[i] = (n.x, n.y, n.z)
@@ -1488,9 +1511,9 @@ def _sample_surface_gap_normals(bvh, tris, polyline, far_away, max_samples=256):
     gap = q_gap[i0] * (1.0 - src + i0.astype(numpy.float32)) + q_gap[i1] * (src - i0.astype(numpy.float32))
     return nrm.astype(numpy.float32), gap.astype(numpy.float32)
 
-def _build_one_path_spline_bundle(polyline, cyclic, bvh, tris, far_away):
+def _build_one_path_spline_bundle(polyline, cyclic, bvh, verts, uvs, nrms, far_away):
     '''Frame + segment arrays for a single spline.'''
-    nrm_pts, gap_pts = _sample_surface_gap_normals(bvh, tris, polyline, far_away)
+    nrm_pts, gap_pts = _sample_surface_gap_normals(bvh, verts, uvs, nrms, polyline, far_away)
     segments = _polyline_to_segments(polyline, cyclic)
     if segments is None:
         return None
@@ -1527,7 +1550,7 @@ def _build_one_path_spline_bundle(polyline, cyclic, bvh, tris, far_away):
         'cyclic': bool(cyclic),
     }
 
-def _build_path_spline_bundles(prepared, bvh, tris, far_away):
+def _build_path_spline_bundles(prepared, bvh, verts, uvs, nrms, far_away):
     '''
     One bundle per spline. Overlapping ribbons must be evaluated separately so a
     texel claimed by the nearer curve (but outside its width) can still be
@@ -1535,14 +1558,14 @@ def _build_path_spline_bundles(prepared, bvh, tris, far_away):
     '''
     bundles = []
     for polyline, cyclic in prepared:
-        bundle = _build_one_path_spline_bundle(polyline, cyclic, bvh, tris, far_away)
+        bundle = _build_one_path_spline_bundle(polyline, cyclic, bvh, verts, uvs, nrms, far_away)
         if bundle is not None:
             bundles.append(bundle)
     return bundles
 
-def _merge_path_spline_bundles(prepared, bvh, tris, far_away):
+def _merge_path_spline_bundles(prepared, bvh, verts, uvs, nrms, far_away):
     '''Legacy helper: pack every spline into one discontinuous segment soup.'''
-    bundles = _build_path_spline_bundles(prepared, bvh, tris, far_away)
+    bundles = _build_path_spline_bundles(prepared, bvh, verts, uvs, nrms, far_away)
     if not bundles:
         return None
     return {
@@ -1604,8 +1627,11 @@ def _closest_on_polyline(points, segments, search_radius, chunk_elems=1500000):
     # neighbourhood so a point still sees every sample within ~radius.
     grid = {}
     skeys = numpy.floor(start / cell).astype(numpy.int64)
+    sx = skeys[:, 0]
+    sy = skeys[:, 1]
+    sz = skeys[:, 2]
     for si in range(seg_count):
-        key = (int(skeys[si, 0]), int(skeys[si, 1]), int(skeys[si, 2]))
+        key = (int(sx[si]), int(sy[si]), int(sz[si]))
         bucket = grid.get(key)
         if bucket is None:
             grid[key] = [si]
@@ -1613,7 +1639,7 @@ def _closest_on_polyline(points, segments, search_radius, chunk_elems=1500000):
             bucket.append(si)
     if not grid:
         return dist, arc, seg_t, seg_i, closest
-    for key, vals in list(grid.items()):
+    for key, vals in grid.items():
         grid[key] = numpy.asarray(vals, dtype=numpy.int32)
 
     sub = points[active]
@@ -1701,14 +1727,26 @@ def _reject_occluded(bvh, origins, targets, grazing=0.15):
     True where the mesh blocks the straight line from origin to target.
     Surfaces the line only skims are ignored: those are neighbouring faces of a
     mesh edge or UV seam the ray runs along, not something standing in the way.
+
+    Caps the number of BVH raycasts — each call is pure Python and dominates
+    bake time on dense wraps. Untested points stay visible (not blocked).
     '''
     count = targets.shape[0]
     blocked = numpy.zeros(count, dtype=bool)
-    if count == 0 or count > _OCCLUSION_TEST_LIMIT:
+    if count == 0:
         return blocked
-    org = origins.astype(numpy.float64)
-    tgt = targets.astype(numpy.float64)
-    for i in range(count):
+
+    if count > _OCCLUSION_TEST_LIMIT:
+        # Stratified subsample — preserves wrap paint instead of rejecting all
+        step = int(math.ceil(float(count) / float(_OCCLUSION_TEST_LIMIT)))
+        sample_idx = numpy.arange(0, count, step, dtype=numpy.int64)
+    else:
+        sample_idx = None
+
+    org = origins.astype(numpy.float64, copy=False)
+    tgt = targets.astype(numpy.float64, copy=False)
+    indices = sample_idx if sample_idx is not None else range(count)
+    for i in indices:
         origin = Vector((org[i, 0], org[i, 1], org[i, 2]))
         target = Vector((tgt[i, 0], tgt[i, 1], tgt[i, 2]))
         ray = target - origin
@@ -2290,7 +2328,7 @@ def bake_shape_to_image(obj, image, curve_obj, uv_name, resolution,
                         path_texture=None, tile_u=1.0, rotation_deg=0.0,
                         feather_px=2.0, project_distance=None,
                         shrinkwrap_method=None, project_axes=(False, False, False),
-                        project_normal=None):
+                        project_normal=None, mesh_cache=None):
     '''
     Fill a closed (cyclic) curve onto the UV image as a solid vector shape.
 
@@ -2311,8 +2349,8 @@ def bake_shape_to_image(obj, image, curve_obj, uv_name, resolution,
     # Ensure cyclic for shape baking
     ensure_curve_cyclic(curve_obj, True)
 
-    bvh, tris, _, _ = _build_mesh_bvh_and_uvs(obj, uv_name)
-    if not bvh or not tris:
+    bvh, verts, tri_uvs, tri_nrms = _get_mesh_bake_geometry(obj, uv_name, mesh_cache)
+    if not bvh or verts is None:
         return False, "UV map '%s' not found on mesh" % uv_name
 
     img_w, img_h = image.size[0], image.size[1]
@@ -2358,7 +2396,6 @@ def bake_shape_to_image(obj, image, curve_obj, uv_name, resolution,
         if forced_normal is not None:
             proj_tag = ' axis'
 
-    verts, tri_uvs, tri_nrms = _tris_to_arrays(tris)
     tex_pxs, tw, th = _load_texture_pixels(path_texture)
     use_tex = tex_pxs is not None
 
@@ -2390,7 +2427,7 @@ def bake_shape_to_image(obj, image, curve_obj, uv_name, resolution,
         surface_n = Vector((0.0, 0.0, 0.0))
         stride = max(1, len(outline) // 24)
         for p in outline[::stride]:
-            hit = _nearest_uv(bvh, tris, p, max_dist=project_distance)
+            hit = _nearest_uv(bvh, verts, tri_uvs, tri_nrms, p, max_dist=project_distance)
             if hit:
                 surface_n += hit[1]
         if surface_n.length > 1e-8 and surface_n.dot(plane_n) < 0.0:
@@ -2443,9 +2480,8 @@ def bake_shape_to_image(obj, image, curve_obj, uv_name, resolution,
         margin = feather_world * 2.5 + cell * 4.0
         grid_w = int(math.ceil((span_u + margin * 2.0) / cell)) + 1
         grid_h = int(math.ceil((span_v + margin * 2.0) / cell)) + 1
-        max_cells = 8000000
-        if grid_w * grid_h > max_cells:
-            cell *= math.sqrt(float(grid_w) * float(grid_h) / max_cells)
+        if grid_w * grid_h > _SHAPE_PLANE_MAX_CELLS:
+            cell *= math.sqrt(float(grid_w) * float(grid_h) / float(_SHAPE_PLANE_MAX_CELLS))
             grid_w = int(math.ceil((span_u + margin * 2.0) / cell)) + 1
             grid_h = int(math.ceil((span_v + margin * 2.0) / cell)) + 1
         grid_u0 = u_min - margin
@@ -2551,7 +2587,8 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
                        path_texture=None, tile_u=1.0, rotation_deg=0.0,
                        project_distance=None, fill_gaps=True, mode='RIBBON',
                        feather_px=2.0, shrinkwrap_method=None,
-                       project_axes=(False, False, False), project_normal=None):
+                       project_axes=(False, False, False), project_normal=None,
+                       mesh_cache=None):
     '''
     Bake a ribbon (or a filled closed shape) from a real 3D curve onto a UV image.
 
@@ -2568,7 +2605,7 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
             path_texture=path_texture, tile_u=tile_u, rotation_deg=rotation_deg,
             feather_px=feather_px, project_distance=project_distance,
             shrinkwrap_method=shrinkwrap_method, project_axes=project_axes,
-            project_normal=project_normal
+            project_normal=project_normal, mesh_cache=mesh_cache
         )
 
     if not obj or obj.type != 'MESH':
@@ -2578,8 +2615,8 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
     if not image:
         return False, 'No target image'
 
-    bvh, tris, _, _ = _build_mesh_bvh_and_uvs(obj, uv_name)
-    if not bvh or not tris:
+    bvh, verts, tri_uvs, tri_nrms = _get_mesh_bake_geometry(obj, uv_name, mesh_cache)
+    if not bvh or verts is None:
         return False, "UV map '%s' not found on mesh" % uv_name
 
     img_w, img_h = image.size[0], image.size[1]
@@ -2638,7 +2675,6 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
     if not prepared:
         return False, 'Curve has too few points to bake'
 
-    verts, tri_uvs, tri_nrms = _tris_to_arrays(tris)
     tex_pxs, tw, th = _load_texture_pixels(path_texture)
     use_tex = tex_pxs is not None
 
@@ -2647,7 +2683,7 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
     search_r = math.sqrt(depth_reach * depth_reach + (half_w * 1.1) ** 2)
     query_pts = []
     for polyline, _cyclic in prepared:
-        query_pts.extend(_decimate_points(polyline, 512))
+        query_pts.extend(_decimate_points(polyline, 192))
     if len(query_pts) > 1:
         spacing = max(
             (query_pts[i + 1] - query_pts[i]).length for i in range(len(query_pts) - 1)
@@ -2667,7 +2703,7 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
             gap_samples.append(float(hit[3]))
     median_gap = float(numpy.median(gap_samples)) if gap_samples else hover_ceiling
     tri_r = half_w * 3.0 + median_gap * 2.0 + spacing * 0.5
-    cand_idx = _tris_near_points(bvh, len(tris), query_pts, tri_r)
+    cand_idx = _tris_near_points(bvh, verts.shape[0], query_pts, tri_r)
     if cand_idx is None:
         curve_np = numpy.array([[p.x, p.y, p.z] for p in query_pts], dtype=numpy.float32)
         lo = curve_np.min(axis=0) - tri_r
@@ -2682,7 +2718,7 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
     accum = _BakeAccumulator(img_w, img_h, use_tex)
     far_away = obj_dim * 1000.0 + 1.0
 
-    bundles = _build_path_spline_bundles(prepared, bvh, tris, far_away)
+    bundles = _build_path_spline_bundles(prepared, bvh, verts, tri_uvs, tri_nrms, far_away)
     if not bundles:
         return False, 'Curve has too few points to bake'
     splines_baked = len(bundles)
@@ -2759,10 +2795,7 @@ def bake_path_to_image(obj, image, curve_obj, uv_name, width, resolution, width_
 
             suspect = numpy.nonzero(away_k)[0]
             if suspect.size:
-                if suspect.size > _OCCLUSION_TEST_LIMIT:
-                    blocked = numpy.ones(suspect.size, dtype=bool)
-                else:
-                    blocked = _reject_occluded(bvh, closest_k[suspect], pts_k[suspect])
+                blocked = _reject_occluded(bvh, closest_k[suspect], pts_k[suspect])
                 if numpy.any(blocked):
                     visible = numpy.ones(ys_k.shape[0], dtype=bool)
                     visible[suspect[blocked]] = False
@@ -3220,7 +3253,7 @@ class YBakePathToLayer(bpy.types.Operator):
         self.report({'INFO'}, msg + ' ({:0.0f} ms)'.format((time.time() - T) * 1000))
         return {'FINISHED'}
 
-def bake_layer_path(obj, layer, context=None, capture_view=False):
+def bake_layer_path(obj, layer, context=None, capture_view=False, mesh_cache=None):
     '''
     Bake one path/shape layer. Returns (ok, message).
 
@@ -3270,6 +3303,7 @@ def bake_layer_path(obj, layer, context=None, capture_view=False):
         shrinkwrap_method=method,
         project_axes=axes,
         project_normal=project_normal,
+        mesh_cache=mesh_cache,
     )
     if ok:
         image.update()
@@ -3324,8 +3358,9 @@ class YBakeAllPaths(bpy.types.Operator):
         T = time.time()
         ok_count = 0
         fail_msgs = []
+        mesh_cache = {}
         for layer in layers:
-            ok, msg = bake_layer_path(obj, layer, context=context)
+            ok, msg = bake_layer_path(obj, layer, context=context, mesh_cache=mesh_cache)
             if ok:
                 ok_count += 1
                 print('INFO: Baked path layer', layer.name + ':', msg)
