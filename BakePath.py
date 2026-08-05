@@ -341,6 +341,7 @@ def duplicate_path_curve_for_layer(layer, duplicated_curves=None):
     '''
     Duplicate the path/shape curve linked to a layer and reassign it.
     Used when duplicating/pasting layers so each layer gets its own curve.
+    Also ensures the bake image is not shared with another layer.
     '''
     if duplicated_curves is None:
         duplicated_curves = {}
@@ -350,10 +351,17 @@ def duplicate_path_curve_for_layer(layer, duplicated_curves=None):
 
     original = get_path_curve_object(layer)
     if not original or original.type != 'CURVE':
+        uniquify_path_bake_image(layer)
         return None
 
-    if original in duplicated_curves:
-        new_curve = duplicated_curves[original]
+    # Prefer pointer keys — RNA object proxies are unreliable as dict keys
+    try:
+        key = original.as_pointer()
+    except Exception:
+        key = original.name
+
+    if key in duplicated_curves:
+        new_curve = duplicated_curves[key]
     else:
         nname = get_unique_name(original.name, bpy.data.objects)
         custom_collection = None
@@ -364,13 +372,14 @@ def duplicate_path_curve_for_layer(layer, duplicated_curves=None):
 
         new_curve = original.copy()
         new_curve.name = nname
-        # Make curve data single-user so editing the copy doesn't affect the original
+        # Always give the duplicate its own curve datablock so editing points
+        # / handles never affects the original layer's curve.
         if original.data:
             new_curve.data = original.data.copy()
             new_curve.data.name = get_unique_name(original.data.name, bpy.data.curves)
 
         link_object(bpy.context.scene, new_curve, custom_collection)
-        duplicated_curves[original] = new_curve
+        duplicated_curves[key] = new_curve
 
         # Keep shrinkwrap targeting the same mesh (parent / existing target)
         if getattr(layer, 'path_enable_shrinkwrap', True):
@@ -383,7 +392,45 @@ def duplicate_path_curve_for_layer(layer, duplicated_curves=None):
                     _apply_layer_shrinkwrap(layer, new_curve, mod.target)
 
     set_path_curve_object(layer, new_curve)
+    uniquify_path_bake_image(layer)
     return new_curve
+
+def uniquify_path_bake_image(layer):
+    '''
+    Ensure this path/shape layer's bake image is not shared with another layer.
+    Otherwise rebaking / editing one duplicate would overwrite the original.
+    '''
+    if not getattr(layer, 'enable_path_bake', False):
+        return None
+    source = get_layer_source(layer)
+    if not source or not getattr(source, 'image', None):
+        return None
+    img = source.image
+    yp = getattr(layer.id_data, 'yp', None)
+    if not yp:
+        return img
+
+    shared = False
+    for other in yp.layers:
+        if other == layer:
+            continue
+        other_src = get_layer_source(other)
+        if other_src and getattr(other_src, 'image', None) == img:
+            shared = True
+            break
+
+    if not shared:
+        return img
+
+    new_img = img.copy()
+    new_img.name = get_unique_name(img.name, bpy.data.images)
+    try:
+        if img.source == 'GENERATED' and hasattr(new_img, 'source'):
+            new_img.source = 'GENERATED'
+    except Exception:
+        pass
+    source.image = new_img
+    return new_img
 
 def get_path_shrinkwrap_modifier(curve_obj):
     if not curve_obj:

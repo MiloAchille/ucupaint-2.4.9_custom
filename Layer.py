@@ -5238,8 +5238,18 @@ def duplicate_layer_nodes_and_images(tree, specific_layers=[], packed_duplicate=
     vcol_names = []
     duplicated_empties = {}
     duplicated_path_curves = {}
+    specific_layer_names = None
+    if specific_layers:
+        specific_layer_names = set()
+        for lay in specific_layers:
+            try:
+                specific_layer_names.add(lay.name)
+            except Exception:
+                pass
+
     for layer in yp.layers:
-        if specific_layers and layer not in specific_layers: continue
+        if specific_layer_names is not None and layer.name not in specific_layer_names:
+            continue
 
         oldtree = get_tree(layer)
         ttree = oldtree.copy()
@@ -5269,7 +5279,7 @@ def duplicate_layer_nodes_and_images(tree, specific_layers=[], packed_duplicate=
         if layer.texcoord_type == 'Decal':
             duplicate_decal_empty_reference(layer.texcoord, ttree, set_new_decal_position, duplicated_empties)
 
-        # Path / shape curve duplicate
+        # Path / shape curve + bake image must be unique per layer
         if getattr(layer, 'enable_path_bake', False):
             BakePath.duplicate_path_curve_for_layer(layer, duplicated_path_curves)
 
@@ -5457,13 +5467,24 @@ def duplicate_layer_nodes_and_images(tree, specific_layers=[], packed_duplicate=
     # Copy image on layer and masks
     for i, img in enumerate(imgs):
 
+        # Path/shape bake images must always be split — rebaking one layer
+        # must never overwrite the sibling's pixels.
+        force_dup = False
+        try:
+            user = img_users[i]
+            if hasattr(user, 'enable_path_bake') and getattr(user, 'enable_path_bake', False):
+                force_dup = True
+        except Exception:
+            force_dup = False
+
         # Check if it's an ondisk image
-        if not img.packed_file and img.filepath != '':
-            if not ondisk_duplicate:
+        if not force_dup:
+            if not img.packed_file and img.filepath != '':
+                if not ondisk_duplicate:
+                    continue
+            # Or packed / generated image
+            elif not packed_duplicate:
                 continue
-        # Or packed image
-        elif not packed_duplicate:
-            continue
 
         if img.yia.is_image_atlas:
             segment = img.yia.segments.get(img_users[i].segment_name)
